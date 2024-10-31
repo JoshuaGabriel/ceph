@@ -295,13 +295,25 @@ class SSHManager:
                                      cmd: RemoteCommand,
                                      stdin: Optional[str] = None,
                                      addr: Optional[str] = None,
-                                     log_command: Optional[bool] = True
+                                     log_command: Optional[bool] = True,
+                                     retries: int = 2
                                      ) -> str:
-        out, err, code = await self._execute_command(host, cmd, stdin, addr, log_command)
-        if code != 0:
-            msg = f'Command {cmd} failed. {err}'
-            logger.debug(msg)
-            raise OrchestratorError(msg)
+        # If connection was dropped retry the command again
+        for attempt in range(retries):
+            try:
+                out, err, code = await self._execute_command(host, cmd, stdin, addr, log_command)
+
+                if code != 0:
+                    msg = f"Command {cmd} failed. {err}"
+                    logger.debug(msg)
+                    raise OrchestratorError(msg)
+
+                return out
+
+            except HostConnectionError:
+                if attempt == retries - 1:
+                    logger.error(f"Failed to connect to {host} after {retries} attempts")
+                    raise
         return out
 
     def check_execute_command(self,
