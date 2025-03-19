@@ -24,7 +24,6 @@ from ceph.deployment.service_spec import (
 from ceph.utils import str_to_datetime, datetime_to_str, datetime_now
 from orchestrator import OrchestratorError, HostSpec, OrchestratorEvent, service_to_daemon_types
 from cephadm.services.cephadmservice import CephadmDaemonDeploySpec
-from mgr_util import parse_combined_pem_file
 
 from .utils import resolve_ip, SpecialHostLabels
 from .migrations import queue_migrate_nfs_spec, queue_migrate_rgw_spec
@@ -51,18 +50,18 @@ class OrchSecretNotFound(OrchestratorError):
     def __init__(
         self,
         message: Optional[str] = '',
-        consumer: Optional[str] = '',
+        entity: Optional[str] = '',
         service_name: Optional[str] = '',
         hostname: Optional[str] = ''
     ):
         if not message:
-            message = f'No secret found for consumer {consumer}'
+            message = f'No secret found for entity {entity}'
             if service_name:
                 message += f' with service name {service_name}'
             if hostname:
                 message += f' with hostname {hostname}'
         super().__init__(message)
-        self.consumer = consumer
+        self.entity = entity
         self.service_name = service_name
         self.hostname = hostname
 
@@ -362,6 +361,7 @@ class SpecStore():
         if update_create:
             self.spec_created[name] = datetime_now()
         self._save(name)
+        self._save_certs_and_keys(spec)
 
     def save_rank_map(self,
                       name: str,
@@ -400,20 +400,11 @@ class SpecStore():
                 else:
                     cert_str = rgw_cert
                 assert isinstance(cert_str, str)
-                cert, key = parse_combined_pem_file(cert_str)
-                if cert and key:
-                    self.mgr.cert_mgr.save_cert(
-                        'rgw_ssl_cert',
-                        cert,
-                        service_name=rgw_spec.service_name(),
-                        user_made=True)
-                    self.mgr.cert_mgr.save_key(
-                        'rgw_ssl_key',
-                        key,
-                        service_name=rgw_spec.service_name(),
-                        user_made=True)
-                else:
-                    logger.error(f'Cannot parse the rgw certificate {cert_str}.')
+                self.mgr.cert_mgr.save_cert(
+                    'rgw_frontend_ssl_cert',
+                    cert_str,
+                    service_name=rgw_spec.service_name(),
+                    user_made=True)
         elif spec.service_type == 'iscsi':
             iscsi_spec = cast(IscsiServiceSpec, spec)
             if iscsi_spec.ssl_cert:
@@ -485,6 +476,7 @@ class SpecStore():
         # type: (str) -> bool
         found = service_name in self._specs
         if found:
+            self._rm_certs_and_keys(self._specs[service_name])
             del self._specs[service_name]
             if service_name in self._rank_maps:
                 del self._rank_maps[service_name]
@@ -1526,7 +1518,7 @@ class HostCache():
         ):
             return True
         created = self.mgr.spec_store.get_created(spec)
-        if not created or created > self.osdspec_last_applied[host][spec.service_name()]:
+        if not created or created > self.last_device_change[host]:
             return True
         return self.osdspec_last_applied[host][spec.service_name()] < self.last_device_change[host]
 
@@ -1613,7 +1605,7 @@ class HostCache():
         assert not daemon.startswith('ha-rgw.')
 
         return self.scheduled_daemon_actions.get(host, {}).get(daemon)
-        
+
     def get_all_scheduled_actions(self) -> List[Tuple[str, str, str]]:
         """Get all scheduled actions as a list of (host, daemon_name, action)"""
         result = []
@@ -1622,55 +1614,54 @@ class HostCache():
                 result.append((host, daemon_name, action))
         return result
 
-    def set_force_action(self, host: str, daemon_name: str, force: bool = True) -> None:
+    def set_force_action(self, host: str, daemon_name: str, force: bool = True) -> bool:
         """
-        Mark a daemon action as forced.
-        
+        Set or clear the force flag for a daemon action.
+
         This is used to track when an action has been explicitly forced by the user,
         allowing the system to override normal safeguards.
         """
         assert not daemon_name.startswith('ha-rgw.')
-        
-        if host not in self.force_actions:
-            self.force_actions[host] = {}
-        self.force_actions[host][daemon_name] = force
+
+        if force:
+            if self.get_scheduled_daemon_action(host, daemon_name) is None:
+                return False  # Cannot set force flag if no scheduled action exists
+            if host not in self.force_actions:
+                self.force_actions[host] = {}
+                self.force_actions[host][daemon_name] = True
+                return True
+            elif daemon_name not in self.force_actions[host] or not self.force_actions[host][daemon_name]:
+                self.force_actions[host][daemon_name] = True
+                return True
+            return False
+        else:
+            return self.clear_force_action(host, daemon_name)
 
     def is_force_action(self, host: str, daemon_name: str) -> bool:
         """
         Check if an action for the specified daemon is marked as forced.
-        
+
         Returns:
             bool: True if the action is forced, False otherwise
         """
         assert not daemon_name.startswith('ha-rgw.')
-        
+
         return self.force_actions.get(host, {}).get(daemon_name, False)
-        
+
     def clear_force_action(self, host: str, daemon_name: str) -> bool:
         """
         Clear the force flag for a daemon action.
-        
+
         Returns:
             bool: True if a force flag was cleared, False otherwise
         """
         found = False
-        if host in self.force_actions:
-            if daemon_name in self.force_actions[host]:
-                del self.force_actions[host][daemon_name]
-                found = True
+        if host in self.force_actions and daemon_name in self.force_actions[host]:
+            del self.force_actions[host][daemon_name]
+            found = True
             if not self.force_actions[host]:
                 del self.force_actions[host]
         return found
-
-
-
-    def get_host_network_ips(self, host: str) -> List[str]:
-        return [
-            ip
-            for net_details in self.networks.get(host, {}).values()
-            for ips in net_details.values()
-            for ip in ips
-        ]
 
 
 class NodeProxyCache:
