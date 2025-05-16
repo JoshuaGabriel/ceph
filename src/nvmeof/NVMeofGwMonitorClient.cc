@@ -42,7 +42,6 @@ NVMeofGwMonitorClient::NVMeofGwMonitorClient(int argc, const char **argv) :
   monc{g_ceph_context, poolctx},
   client_messenger(Messenger::create(g_ceph_context, "async", entity_name_t::CLIENT(-1), "client", getpid())),
   objecter{g_ceph_context, client_messenger.get(), &monc, poolctx},
-  client{client_messenger.get(), &monc, &objecter},
   timer(g_ceph_context, beacon_lock),
   orig_argc(argc),
   orig_argv(argv)
@@ -50,14 +49,6 @@ NVMeofGwMonitorClient::NVMeofGwMonitorClient(int argc, const char **argv) :
 }
 
 NVMeofGwMonitorClient::~NVMeofGwMonitorClient() = default;
-
-const char** NVMeofGwMonitorClient::get_tracked_conf_keys() const
-{
-  static const char* KEYS[] = {
-    NULL
-  };
-  return KEYS;
-}
 
 std::string read_file(const std::string& filename) {
     std::ifstream file(filename);
@@ -134,7 +125,6 @@ int NVMeofGwMonitorClient::init()
   // Initialize Messenger
   client_messenger->add_dispatcher_tail(this);
   client_messenger->add_dispatcher_head(&objecter);
-  client_messenger->add_dispatcher_tail(&client);
   client_messenger->start();
 
   poolctx.start(2);
@@ -147,19 +137,17 @@ int NVMeofGwMonitorClient::init()
   }
 
   monc.sub_want("NVMeofGw", 0, 0);
-  monc.set_want_keys(CEPH_ENTITY_TYPE_MON|CEPH_ENTITY_TYPE_OSD
-      |CEPH_ENTITY_TYPE_MDS|CEPH_ENTITY_TYPE_MGR);
+  monc.set_want_keys(CEPH_ENTITY_TYPE_MON|CEPH_ENTITY_TYPE_OSD);
   monc.set_messenger(client_messenger.get());
 
   // We must register our config callback before calling init(), so
   // that we see the initial configuration message
-  monc.register_config_callback([this](const std::string &k, const std::string &v){
+  monc.register_config_callback([](const std::string &k, const std::string &v){
       // leaving this for debugging purposes
       dout(10) << "nvmeof config_callback: " << k << " : " << v << dendl;
-      
       return false;
     });
-  monc.register_config_notify_callback([this]() {
+  monc.register_config_notify_callback([]() {
       dout(4) << "nvmeof monc config notify callback" << dendl;
     });
   dout(4) << "nvmeof Registered monc callback" << dendl;
@@ -190,7 +178,6 @@ int NVMeofGwMonitorClient::init()
   objecter.init();
   objecter.enable_blocklist_events();
   objecter.start();
-  client.init();
   timer.init();
 
   {
@@ -249,7 +236,7 @@ void NVMeofGwMonitorClient::send_beacon()
   auto group_key = std::make_pair(pool, group);
   NvmeGwClientState old_gw_state;
   // if already got gateway state in the map
-  if (get_gw_state("old map", map, group_key, name, old_gw_state))
+  if (first_beacon == false && get_gw_state("old map", map, group_key, name, old_gw_state))
     gw_availability = ok ? gw_availability_t::GW_AVAILABLE : gw_availability_t::GW_UNAVAILABLE;
   dout(10) << "sending beacon as gid " << monc.get_global_id() << " availability " << (int)gw_availability <<
     " osdmap_epoch " << osdmap_epoch << " gwmap_epoch " << gwmap_epoch << dendl;
@@ -281,7 +268,7 @@ void NVMeofGwMonitorClient::tick()
 
   disconnect_panic();
   send_beacon();
-
+  first_beacon = false;
   timer.add_event_after(
       g_conf().get_val<std::chrono::seconds>("nvmeof_mon_client_tick_period").count(),
       new LambdaContext([this](int r){
@@ -302,8 +289,7 @@ void NVMeofGwMonitorClient::shutdown()
     std::lock_guard bl(beacon_lock);
     timer.shutdown();
   }
-  // client uses monc and objecter
-  client.shutdown();
+
   // Stop asio threads, so leftover events won't call into shut down
   // monclient/objecter.
   poolctx.finish();
@@ -433,16 +419,17 @@ void NVMeofGwMonitorClient::handle_nvmeof_gw_map(ceph::ref_t<MNVMeofGwMap> nmap)
   map = new_map;
 }
 
-bool NVMeofGwMonitorClient::ms_dispatch2(const ref_t<Message>& m)
+Dispatcher::dispatch_result_t NVMeofGwMonitorClient::ms_dispatch2(const ref_t<Message>& m)
 {
   std::lock_guard l(lock);
   dout(10) << "got map type " << m->get_type() << dendl;
 
   if (m->get_type() == MSG_MNVMEOF_GW_MAP) {
     handle_nvmeof_gw_map(ref_cast<MNVMeofGwMap>(m));
+    return Dispatcher::HANDLED();
+
   }
-  bool handled = false;
-  return handled;
+  return Dispatcher::ACKNOWLEDGED();
 }
 
 int NVMeofGwMonitorClient::main(std::vector<const char *> args)

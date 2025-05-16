@@ -586,16 +586,6 @@ options:
   min: 1
   services:
   - mds
-- name: mds_log_major_segment_event_ratio
-  type: uint
-  level: advanced
-  desc: multiple of mds_log_events_per_segment between major segments
-  default: 12
-  services:
-  - mds
-  min: 1
-  see_also:
-  - mds_log_events_per_segment
 # segment size for mds log, default to default file_layout_t
 - name: mds_log_segment_size
   type: size
@@ -999,6 +989,14 @@ options:
   services:
   - mds
   fmt_desc: Ceph will randomly fragment or merge directories.
+  with_legacy: true
+- name: mds_allow_async_dirops
+  type: bool
+  level: advanced
+  default: true
+  services:
+  - mds
+  fmt_desc: MDS will enable/disable the async dirop feature.
   with_legacy: true
 - name: mds_dump_cache_on_map
   type: bool
@@ -1723,6 +1721,12 @@ options:
   default: 1000
   services:
   - mds
+- name: mds_delay_journal_replay_for_testing
+  type: millisecs
+  level: dev
+  desc: Delay the journal replay to verify the replay time estimate
+  long_desc: Jorunal replay warning is activated if the mds has been in replay state for more than 30 seconds. This config delays replay for validating the replay warning in tests.
+  default: 0
   flags:
   - runtime
 - name: mds_server_dispatch_killpoint_random
@@ -1741,3 +1745,21 @@ options:
   - mds
   flags:
   - runtime
+- name: mds_log_minor_segments_per_major_segment
+  type: uint
+  level: advanced
+  desc: number of minor segments per major segment.
+  long_desc: The number of minor mds log segments since last major segment after which a major segment is started/logged.
+  default: 16
+  services:
+  - mds
+  min: 4
+- name: mds_file_blockdiff_max_concurrent_object_scans
+  type: uint
+  level: advanced
+  desc: maximum number of concurrent object scans
+  long_desc: Maximum number of concurrent listsnaps operations sent to RADOS.
+  default: 16
+  services:
+  - mds
+  min: 1

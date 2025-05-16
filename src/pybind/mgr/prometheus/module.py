@@ -8,7 +8,6 @@ import re
 import threading
 import time
 import enum
-from packaging import version  # type: ignore
 from collections import namedtuple
 import tempfile
 
@@ -18,7 +17,6 @@ from orchestrator import OrchestratorClientMixin, raise_if_exception, Orchestrat
 from rbd import RBD
 
 from typing import DefaultDict, Optional, Dict, Any, Set, cast, Tuple, Union, List, Callable, IO
-
 LabelValues = Tuple[str, ...]
 Number = Union[int, float]
 MetricValue = Dict[LabelValues, Number]
@@ -28,21 +26,6 @@ MetricValue = Dict[LabelValues, Number]
 # for Prometheus exporter port registry
 
 DEFAULT_PORT = 9283
-
-# When the CherryPy server in 3.2.2 (and later) starts it attempts to verify
-# that the ports its listening on are in fact bound. When using the any address
-# "::" it tries both ipv4 and ipv6, and in some environments (e.g. kubernetes)
-# ipv6 isn't yet configured / supported and CherryPy throws an uncaught
-# exception.
-if cherrypy is not None:
-    Version = version.Version
-    v = Version(cherrypy.__version__)
-    # the issue was fixed in 3.2.3. it's present in 3.2.2 (current version on
-    # centos:7) and back to at least 3.0.0.
-    if Version("3.1.2") <= v < Version("3.2.3"):
-        # https://github.com/cherrypy/cherrypy/issues/1100
-        from cherrypy.process import servers
-        servers.wait_for_occupied_port = lambda host, port: None
 
 
 # cherrypy likes to sys.exit on error.  don't let it take us down too!
@@ -110,7 +93,7 @@ OSD_STATUS = ['weight', 'up', 'in']
 
 OSD_STATS = ['apply_latency_ms', 'commit_latency_ms']
 
-POOL_METADATA = ('pool_id', 'name', 'type', 'description', 'compression_mode')
+POOL_METADATA = ('pool_id', 'name', 'type', 'description', 'compression_mode', 'application')
 
 RGW_METADATA = ('ceph_daemon', 'hostname', 'ceph_version', 'instance_id')
 
@@ -141,6 +124,12 @@ class Format(enum.Enum):
     json = 'json'
     json_pretty = 'json-pretty'
     yaml = 'yaml'
+
+
+class StorageType(enum.Enum):
+    rbd = "Block"
+    cephfs = "Filesystem"
+    rgw = "Object"
 
 
 class HealthCheckEvent:
@@ -1283,13 +1272,20 @@ class Module(MgrModule, OrchestratorClientMixin):
             if 'options' in pool:
                 compression_mode = pool['options'].get('compression_mode', 'none')
 
+            application_metadata = pool.get('application_metadata', {})
+            application_metadata_str = ', '.join(StorageType[k].value
+                                                 if k in StorageType.__members__ else str(k)
+                                                 for k in application_metadata
+                                                 )
             self.metrics['pool_metadata'].set(
                 1, (
                     pool['pool'],
                     pool['pool_name'],
                     pool_type,
                     pool_description,
-                    compression_mode)
+                    compression_mode,
+                    application_metadata_str,
+                ),
             )
 
         # Populate other servers metadata

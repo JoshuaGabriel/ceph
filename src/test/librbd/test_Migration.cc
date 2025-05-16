@@ -20,6 +20,8 @@
 #include "common/Cond.h"
 #include <boost/scope_exit.hpp>
 
+#include <shared_mutex> // for std::shared_lock
+
 void register_test_migration() {
 }
 
@@ -328,6 +330,16 @@ struct TestMigration : public TestFixture {
     librbd::NoOpProgressContext no_op;
     ASSERT_EQ(0, m_ref_ictx->operations->resize(size, true, no_op));
     ASSERT_EQ(0, m_ictx->operations->resize(size, true, no_op));
+  }
+
+  void test_children(bool have, std::string initial_image_name) {
+    std::vector<librbd::linked_image_spec_t> images;
+    librbd::ImageCtx *initial_ictx = nullptr;
+    open_image(m_ioctx, initial_image_name, &initial_ictx);
+    EXPECT_EQ(0, librbd::api::Image<>::snap_set(
+                initial_ictx, cls::rbd::UserSnapshotNamespace(), "snap"));
+    ASSERT_EQ(0, librbd::api::Image<>::list_children(initial_ictx, &images));
+    ASSERT_EQ(have, !images.empty());
   }
 
   void test_no_snaps() {
@@ -1051,6 +1063,8 @@ TEST_F(TestMigration, CloneUpdateAfterPrepare)
 {
   REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
 
+  auto initial_image_name = m_image_name;
+
   write(0, 10, 'X');
   snap_create("snap");
   clone("snap");
@@ -1059,8 +1073,31 @@ TEST_F(TestMigration, CloneUpdateAfterPrepare)
 
   write(0, 1, 'Y');
 
+  test_children(true, initial_image_name);
   migration_execute(m_ioctx, m_image_name);
   migration_commit(m_ioctx, m_image_name);
+  test_children(true, initial_image_name);
+}
+
+TEST_F(TestMigration, CloneFlatten)
+{
+  REQUIRE_FEATURE(RBD_FEATURE_LAYERING);
+
+  auto initial_image_name = m_image_name;
+
+  write(0, 10, 'X');
+  snap_create("snap");
+  clone("snap");
+
+  ASSERT_EQ(0, m_opts.set(RBD_IMAGE_OPTION_FLATTEN, 1));
+  migration_prepare(m_ioctx, m_image_name);
+
+  write(0, 1, 'Y');
+
+  test_children(true, initial_image_name);
+  migration_execute(m_ioctx, m_image_name);
+  migration_commit(m_ioctx, m_image_name);
+  test_children(false, initial_image_name);
 }
 
 TEST_F(TestMigration, TriggerAssertSnapcSeq)

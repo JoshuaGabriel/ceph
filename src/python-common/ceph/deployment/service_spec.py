@@ -25,7 +25,9 @@ from typing import (
 import yaml
 
 from ceph.deployment.hostspec import HostSpec, SpecValidationError, assert_valid_host
-from ceph.deployment.utils import unwrap_ipv6, valid_addr
+from ceph.deployment.utils import unwrap_ipv6, valid_addr, verify_non_negative_int
+from ceph.deployment.utils import verify_positive_int, verify_non_negative_number
+from ceph.deployment.utils import verify_boolean, verify_enum
 from ceph.utils import is_hex
 
 ServiceSpecT = TypeVar('ServiceSpecT', bound='ServiceSpec')
@@ -527,8 +529,8 @@ pattern_type=PatternType.fnmatch))
         labels = [x for x in strings if 'label:' in x]
         if len(labels) > 1:
             raise SpecValidationError('more than one label provided: {}'.format(labels))
-        for l in labels:
-            strings.remove(l)
+        for lbl in labels:
+            strings.remove(lbl)
         label = labels[0][6:] if labels else None
 
         host_patterns = strings
@@ -701,7 +703,7 @@ class ArgumentSpec:
         if isinstance(data, str):
             return cls(data, split=True, origin=cls.OriginalType.STRING)
         if 'argument' not in data:
-            raise SpecValidationError(f'ArgumentSpec must have an "argument" field')
+            raise SpecValidationError('ArgumentSpec must have an "argument" field')
         for k in data.keys():
             if k not in cls._fields:
                 raise SpecValidationError(f'ArgumentSpec got an unknown field {k!r}')
@@ -1139,6 +1141,7 @@ class NFSServiceSpec(ServiceSpec):
                  config: Optional[Dict[str, str]] = None,
                  networks: Optional[List[str]] = None,
                  port: Optional[int] = None,
+                 monitoring_port: Optional[int] = None,
                  virtual_ip: Optional[str] = None,
                  enable_nlm: bool = False,
                  enable_haproxy_protocol: bool = False,
@@ -1155,6 +1158,7 @@ class NFSServiceSpec(ServiceSpec):
             extra_entrypoint_args=extra_entrypoint_args, custom_configs=custom_configs)
 
         self.port = port
+        self.monitoring_port = monitoring_port
         self.virtual_ip = virtual_ip
         self.enable_haproxy_protocol = enable_haproxy_protocol
         self.idmap_conf = idmap_conf
@@ -1220,15 +1224,20 @@ class RGWSpec(ServiceSpec):
                  extra_container_args: Optional[GeneralArgList] = None,
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
+                 only_bind_port_on_networks: bool = False,
                  rgw_realm_token: Optional[str] = None,
                  update_endpoints: Optional[bool] = False,
                  zone_endpoints: Optional[str] = None,  # comma separated endpoints list
                  zonegroup_hostnames: Optional[List[str]] = None,
+                 data_pool_attributes: Optional[Dict[str, str]] = None,
                  rgw_user_counters_cache: Optional[bool] = False,
                  rgw_user_counters_cache_size: Optional[int] = None,
                  rgw_bucket_counters_cache: Optional[bool] = False,
                  rgw_bucket_counters_cache_size: Optional[int] = None,
                  generate_cert: bool = False,
+                 disable_multisite_sync_traffic: Optional[bool] = None,
+                 wildcard_enabled: Optional[bool] = False,
+                 rgw_exit_timeout_secs: int = 120,
                  ):
         assert service_type == 'rgw', service_type
 
@@ -1270,6 +1279,8 @@ class RGWSpec(ServiceSpec):
         self.update_endpoints = update_endpoints
         self.zone_endpoints = zone_endpoints
         self.zonegroup_hostnames = zonegroup_hostnames
+        #: Whether to limit ip we bind to to what's specified in "networks" parameter
+        self.only_bind_port_on_networks = only_bind_port_on_networks
 
         #: To track op metrics by user config value rgw_user_counters_cache must be set to true
         self.rgw_user_counters_cache = rgw_user_counters_cache
@@ -1281,17 +1292,38 @@ class RGWSpec(ServiceSpec):
         self.rgw_bucket_counters_cache_size = rgw_bucket_counters_cache_size
         #: Whether we should generate a cert/key for the user if not provided
         self.generate_cert = generate_cert
+        #: Used to make RGW not do multisite replication so it can dedicate to IO
+        self.disable_multisite_sync_traffic = disable_multisite_sync_traffic
+        self.wildcard_enabled = wildcard_enabled
+        #: Attributes for <zone-name>.rgw.buckets.data pool created in rgw realm bootstrap command
+        self.data_pool_attributes = data_pool_attributes
+        #: How long the RGW will wait to try and complete client requests when told to shut down
+        self.rgw_exit_timeout_secs = rgw_exit_timeout_secs
 
     def get_port_start(self) -> List[int]:
-        return [self.get_port()]
+        ports = self.get_port()
+        return ports
 
-    def get_port(self) -> int:
+    def get_port(self) -> List[int]:
+        ports = []
         if self.rgw_frontend_port:
-            return self.rgw_frontend_port
-        if self.ssl:
-            return 443
-        else:
-            return 80
+            ports.append(self.rgw_frontend_port)
+
+        ssl_port = next(
+            (
+                int(arg.split('=')[1])
+                for arg in (self.rgw_frontend_extra_args or [])
+                if arg.startswith("ssl_port=")
+            ),
+            None,
+        )
+
+        if self.ssl and ssl_port:
+            ports.append(ssl_port)
+        if not ports:
+            ports.append(443 if self.ssl else 80)
+
+        return ports
 
     def validate(self) -> None:
         super(RGWSpec, self).validate()
@@ -1313,6 +1345,22 @@ class RGWSpec(ServiceSpec):
             raise SpecValidationError('"ssl" field must be set to true when "generate_cert" '
                                       'is set to true')
 
+        if self.generate_cert and self.rgw_frontend_ssl_certificate:
+            raise SpecValidationError('"generate_cert" field and "rgw_frontend_ssl_certificate" '
+                                      'field are mutually exclusive')
+
+        if self.data_pool_attributes:
+            if self.data_pool_attributes.get('type', 'ec') == 'ec':
+                if any(attr not in self.data_pool_attributes.keys() for attr in ['k', 'm']):
+                    raise SpecValidationError(
+                        '"k" and "m" are required parameters for ec pool (defaults to ec pool)'
+                    )
+                if 'erasure_code_profile' in self.data_pool_attributes.keys():
+                    raise SpecValidationError(
+                        'invalid option in data_pool_attribues "erasure_code_profile"'
+                        'ec profile will be generated automatically based on provided attributes'
+                    )
+
 
 yaml.add_representer(RGWSpec, ServiceSpec.yaml_representer)
 
@@ -1324,30 +1372,52 @@ class NvmeofServiceSpec(ServiceSpec):
                  name: Optional[str] = None,
                  group: Optional[str] = None,
                  addr: Optional[str] = None,
+                 addr_map: Optional[Dict[str, str]] = None,
                  port: Optional[int] = None,
                  pool: Optional[str] = None,
                  enable_auth: bool = False,
                  state_update_notify: Optional[bool] = True,
                  state_update_interval_sec: Optional[int] = 5,
                  enable_spdk_discovery_controller: Optional[bool] = False,
+                 encryption_key: Optional[str] = None,
+                 rebalance_period_sec: Optional[int] = 7,
+                 max_gws_in_grp: Optional[int] = 16,
+                 max_ns_to_change_lb_grp: Optional[int] = 8,
+                 abort_on_errors: Optional[bool] = True,
+                 omap_file_ignore_unlock_errors: Optional[bool] = False,
+                 omap_file_lock_on_read: Optional[bool] = True,
                  omap_file_lock_duration: Optional[int] = 20,
                  omap_file_lock_retries: Optional[int] = 30,
                  omap_file_lock_retry_sleep_interval: Optional[float] = 1.0,
                  omap_file_update_reloads: Optional[int] = 10,
                  enable_prometheus_exporter: Optional[bool] = True,
-                 bdevs_per_cluster: Optional[int] = 32,
+                 prometheus_port: Optional[int] = 10008,
+                 prometheus_stats_interval: Optional[int] = 10,
+                 bdevs_per_cluster: Optional[int] = None,
+                 flat_bdevs_per_cluster: Optional[int] = None,
+                 cluster_connections: Optional[int] = None,
                  verify_nqns: Optional[bool] = True,
+                 verify_keys: Optional[bool] = True,
+                 verify_listener_ip: Optional[bool] = True,
                  allowed_consecutive_spdk_ping_failures: Optional[int] = 1,
                  spdk_ping_interval_in_seconds: Optional[float] = 2.0,
                  ping_spdk_under_lock: Optional[bool] = False,
-                 max_hosts_per_namespace: Optional[int] = 1,
+                 max_hosts_per_namespace: Optional[int] = 8,
                  max_namespaces_with_netmask: Optional[int] = 1000,
+                 max_subsystems: Optional[int] = 128,
+                 max_hosts: Optional[int] = 2048,
+                 max_namespaces: Optional[int] = 2048,
+                 max_namespaces_per_subsystem: Optional[int] = 256,
+                 max_hosts_per_subsystem: Optional[int] = 128,
                  server_key: Optional[str] = None,
                  server_cert: Optional[str] = None,
                  client_key: Optional[str] = None,
                  client_cert: Optional[str] = None,
                  root_ca_cert: Optional[str] = None,
+                 # unused and duplicate of tgt_path below, consider removing
                  spdk_path: Optional[str] = None,
+                 spdk_mem_size: Optional[int] = None,
+                 spdk_huge_pages: Optional[int] = None,
                  tgt_path: Optional[str] = None,
                  spdk_timeout: Optional[float] = 60.0,
                  spdk_log_level: Optional[str] = '',
@@ -1360,8 +1430,12 @@ class NvmeofServiceSpec(ServiceSpec):
                  transport_tcp_options: Optional[Dict[str, int]] =
                  {"in_capsule_data_size": 8192, "max_io_qpairs_per_ctrlr": 7},
                  tgt_cmd_extra_args: Optional[str] = None,
+                 iobuf_options: Optional[Dict[str, int]] = None,
+                 qos_timeslice_in_usecs: Optional[int] = 0,
                  discovery_addr: Optional[str] = None,
+                 discovery_addr_map: Optional[Dict[str, str]] = None,
                  discovery_port: Optional[int] = None,
+                 abort_discovery_on_errors: Optional[bool] = True,
                  log_level: Optional[str] = 'INFO',
                  log_files_enabled: Optional[bool] = True,
                  log_files_rotation_enabled: Optional[bool] = True,
@@ -1395,6 +1469,8 @@ class NvmeofServiceSpec(ServiceSpec):
         self.pool = pool
         #: ``addr`` address of the nvmeof gateway
         self.addr = addr
+        #: ``addr_map`` per node address map of the nvmeof gateways
+        self.addr_map = addr_map
         #: ``port`` port of the nvmeof gateway
         self.port = port or 5500
         #: ``name`` name of the nvmeof gateway
@@ -1409,10 +1485,32 @@ class NvmeofServiceSpec(ServiceSpec):
         self.state_update_interval_sec = state_update_interval_sec
         #: ``enable_spdk_discovery_controller`` SPDK or ceph-nvmeof discovery service
         self.enable_spdk_discovery_controller = enable_spdk_discovery_controller
+        #: ``encryption_key`` gateway encryption key
+        self.encryption_key = encryption_key
+        #: ``rebalance_period_sec`` number of seconds between cycles of auto namesapce rebalancing
+        self.rebalance_period_sec = rebalance_period_sec
+        #: ``max_gws_in_grp`` max number of gateways in one group
+        self.max_gws_in_grp = max_gws_in_grp
+        #: ``max_ns_to_change_lb_grp`` max number of namespaces before switching to a new lb group
+        self.max_ns_to_change_lb_grp = max_ns_to_change_lb_grp
         #: ``enable_prometheus_exporter`` enables Prometheus exporter
         self.enable_prometheus_exporter = enable_prometheus_exporter
+        #: ``prometheus_port`` Prometheus port
+        self.prometheus_port = prometheus_port or 10008
+        #: ``prometheus_stats_interval`` Prometheus get stats interval
+        self.prometheus_stats_interval = prometheus_stats_interval
         #: ``verify_nqns`` enables verification of subsystem and host NQNs for validity
         self.verify_nqns = verify_nqns
+        #: ``verify_keys`` enables verification of PSJ and DHCHAP keys in the gateway
+        self.verify_keys = verify_keys
+        #: ``verify_listener_ip`` enables verification of listener IP address
+        self.verify_listener_ip = verify_listener_ip
+        #: ``abort_on_errors`` abort gateway in case of errors
+        self.abort_on_errors = abort_on_errors
+        #: ``omap_file_ignore_unlock_errors`` ignore errors when unlocking the OMAP file
+        self.omap_file_ignore_unlock_errors = omap_file_ignore_unlock_errors
+        #: ``omap_file_lock_on_read`` lock omap when reading its content
+        self.omap_file_lock_on_read = omap_file_lock_on_read
         #: ``omap_file_lock_duration`` number of seconds before automatically unlock OMAP file lock
         self.omap_file_lock_duration = omap_file_lock_duration
         #: ``omap_file_lock_retries`` number of retries to lock OMAP file before giving up
@@ -1425,14 +1523,38 @@ class NvmeofServiceSpec(ServiceSpec):
         self.max_hosts_per_namespace = max_hosts_per_namespace
         #: ``max_namespaces_with_netmask`` max number of namespaces which are not auto visible
         self.max_namespaces_with_netmask = max_namespaces_with_netmask
+        #: ``max_subsystems`` max number of subsystems
+        self.max_subsystems = max_subsystems
+        #: ``max_hosts`` max number of hosts on all subsystems
+        self.max_hosts = max_hosts
+        #: ``max_namespaces`` max number of namespaces on all subsystems
+        self.max_namespaces = max_namespaces
+        #: ``max_namespaces_per_subsystem`` max number of namespaces per one subsystem
+        self.max_namespaces_per_subsystem = max_namespaces_per_subsystem
+        #: ``max_hosts_per_subsystem`` max number of hosts per subsystems
+        self.max_hosts_per_subsystem = max_hosts_per_subsystem
         #: ``allowed_consecutive_spdk_ping_failures`` # of ping failures before aborting gateway
         self.allowed_consecutive_spdk_ping_failures = allowed_consecutive_spdk_ping_failures
         #: ``spdk_ping_interval_in_seconds`` sleep interval in seconds between SPDK pings
         self.spdk_ping_interval_in_seconds = spdk_ping_interval_in_seconds
         #: ``ping_spdk_under_lock`` whether or not we should perform SPDK ping under the RPC lock
         self.ping_spdk_under_lock = ping_spdk_under_lock
+        #  spdk to ceph connection mapping
+        #: see
+        #: https://github.com/ceph/ceph-nvmeof?tab=readme-ov-file#mapping-spdk-bdevs-into-a-ceph-rados-cluster-context # noqa: E501
         #: ``bdevs_per_cluster`` number of bdevs per cluster
         self.bdevs_per_cluster = bdevs_per_cluster
+        #: ``flat_bdevs_per_cluster`` number of bdevs per cluster, ignore ANA group
+        self.flat_bdevs_per_cluster = flat_bdevs_per_cluster
+        #: ``cluster_connections`` number of ceph cluster connections
+        self.cluster_connections = cluster_connections
+        # set default only if all spdk alloc stratgies are None (no parameters explicitly defined)
+        if all([
+            self.bdevs_per_cluster is None,
+            self.flat_bdevs_per_cluster is None,
+            self.cluster_connections is None
+        ]):
+            self.cluster_connections = 32
         #: ``server_key`` gateway server key
         self.server_key = server_key
         #: ``server_cert`` gateway server certificate
@@ -1443,8 +1565,12 @@ class NvmeofServiceSpec(ServiceSpec):
         self.client_cert = client_cert
         #: ``root_ca_cert`` CA cert for server/client certs
         self.root_ca_cert = root_ca_cert
-        #: ``spdk_path`` path to SPDK
+        #: ``spdk_path`` path is unused and duplicate of tgt_path below, consider removing
         self.spdk_path = spdk_path or '/usr/local/bin/nvmf_tgt'
+        #: ``spdk_mem_size`` memory size in MB for DPDK
+        self.spdk_mem_size = spdk_mem_size
+        #: ``spdk_huge_pages`` huge pages count to be be used by SPDK
+        self.spdk_huge_pages = spdk_huge_pages
         #: ``tgt_path`` nvmeof target path
         self.tgt_path = tgt_path or '/usr/local/bin/nvmf_tgt'
         #: ``spdk_timeout`` SPDK connectivity timeout
@@ -1467,10 +1593,18 @@ class NvmeofServiceSpec(ServiceSpec):
         self.transport_tcp_options: Optional[Dict[str, int]] = transport_tcp_options
         #: ``tgt_cmd_extra_args`` extra arguments for the nvmf_tgt process
         self.tgt_cmd_extra_args = tgt_cmd_extra_args
+        #: List of extra arguments for SPDK iobuf in the form opt=value
+        self.iobuf_options: Optional[Dict[str, int]] = iobuf_options
+        #: ``qos_timeslice_in_usecs`` timeslice for QOS code, in micro seconds
+        self.qos_timeslice_in_usecs = qos_timeslice_in_usecs
         #: ``discovery_addr`` address of the discovery service
         self.discovery_addr = discovery_addr
+        #: ``discovery_addr_map`` per node address map of the discovery service
+        self.discovery_addr_map = discovery_addr_map
         #: ``discovery_port`` port of the discovery service
         self.discovery_port = discovery_port or 8009
+        #: ``abort_discovery_on_errors`` abort discovery service in case of errors
+        self.abort_discovery_on_errors = abort_discovery_on_errors
         #: ``log_level`` the nvmeof gateway log level
         self.log_level = log_level or 'INFO'
         #: ``log_files_enabled`` enables the usage of files to keep the nameof gateway log
@@ -1495,7 +1629,38 @@ class NvmeofServiceSpec(ServiceSpec):
         self.monitor_client_log_file_dir = monitor_client_log_file_dir
 
     def get_port_start(self) -> List[int]:
-        return [5500, 4420, 8009]
+        return [self.port, 4420, self.discovery_port, self.prometheus_port]
+
+    def verify_spdk_ceph_connection_allocation(self) -> None:
+        """
+        Validate that exactly one of bdevs_per_cluster, flat_bdevs_per_cluster, or
+        cluster_connections is defined (not None), and that the defined parameter
+        is a positive integer.
+
+        Raises:
+            SpecValidationError: If zero or more than one parameter is defined,
+                                or if the defined parameter is not a positive integer.
+        """
+        defined_vars = [
+            ('bdevs_per_cluster', self.bdevs_per_cluster),
+            ('flat_bdevs_per_cluster', self.flat_bdevs_per_cluster),
+            ('cluster_connections', self.cluster_connections)
+        ]
+
+        defined_count = sum(1 for _, value in defined_vars if value is not None)
+
+        if defined_count != 1:
+            raise SpecValidationError(
+                "Exactly one of 'bdevs_per_cluster', 'flat_bdevs_per_cluster', or "
+                "'cluster_connections' must be defined (not None); others must be None. "
+                f"Found {defined_count} defined parameters."
+            )
+
+        # validate the defined parameter
+        for name, value in defined_vars:
+            if value is not None:
+                verify_positive_int(value, name)
+                break  # only one should be defined, so we can stop after validating it
 
     def validate(self) -> None:
         #  TODO: what other parameters should be validated as part of this function?
@@ -1504,6 +1669,7 @@ class NvmeofServiceSpec(ServiceSpec):
         if not self.pool:
             raise SpecValidationError('Cannot add NVMEOF: No Pool specified')
 
+        verify_boolean(self.enable_auth, "Enable authentication")
         if self.enable_auth:
             if not all([self.server_key, self.server_cert, self.client_key,
                         self.client_cert, self.root_ca_cert]):
@@ -1518,112 +1684,75 @@ class NvmeofServiceSpec(ServiceSpec):
         if self.transports not in ['tcp']:
             raise SpecValidationError('Invalid transport. Valid values are tcp')
 
-        if self.log_level:
-            if self.log_level.lower() not in ['debug',
-                                              'info',
-                                              'warning',
-                                              'error',
-                                              'critical']:
-                raise SpecValidationError(
-                    'Invalid log level. Valid values are: debug, info, warning, error, critial')
+        verify_enum(self.log_level, "log level", ['debug', 'info', 'warning', 'error', 'critical'])
+        verify_enum(self.spdk_log_level, "SPDK log level",
+                    ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'NOTICE'])
+        verify_enum(self.spdk_protocol_log_level, "SPDK protocol log level",
+                    ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'NOTICE'])
+        self.verify_spdk_ceph_connection_allocation()
+        verify_non_negative_int(self.qos_timeslice_in_usecs, "QOS timeslice")
 
-        if self.spdk_log_level:
-            if self.spdk_log_level.lower() not in ['debug',
-                                                   'info',
-                                                   'warning',
-                                                   'error',
-                                                   'notice']:
-                raise SpecValidationError(
-                    'Invalid SPDK log level. Valid values are: '
-                    'DEBUG, INFO, WARNING, ERROR, NOTICE')
-
-        if self.spdk_protocol_log_level:
-            if self.spdk_protocol_log_level.lower() not in ['debug',
-                                                            'info',
-                                                            'warning',
-                                                            'error',
-                                                            'notice']:
-                raise SpecValidationError(
-                    'Invalid SPDK protocol log level. Valid values are: '
-                    'DEBUG, INFO, WARNING, ERROR, NOTICE')
-
+        verify_non_negative_number(self.spdk_ping_interval_in_seconds, "SPDK ping interval")
         if (
-            self.spdk_ping_interval_in_seconds
+            self.spdk_ping_interval_in_seconds is not None
             and self.spdk_ping_interval_in_seconds < 1.0
         ):
             raise SpecValidationError("SPDK ping interval should be at least 1 second")
 
+        verify_non_negative_int(self.allowed_consecutive_spdk_ping_failures,
+                                "Allowed consecutive SPDK ping failures")
         if (
-            self.allowed_consecutive_spdk_ping_failures
+            self.allowed_consecutive_spdk_ping_failures is not None
             and self.allowed_consecutive_spdk_ping_failures < 1
         ):
             raise SpecValidationError("Allowed consecutive SPDK ping failures should be at least 1")
 
-        if (
-            self.state_update_interval_sec
-            and self.state_update_interval_sec < 0
-        ):
-            raise SpecValidationError("State update interval can't be negative")
-
-        if (
-            self.omap_file_lock_duration
-            and self.omap_file_lock_duration < 0
-        ):
-            raise SpecValidationError("OMAP file lock duration can't be negative")
-
-        if (
-            self.omap_file_lock_retries
-            and self.omap_file_lock_retries < 0
-        ):
-            raise SpecValidationError("OMAP file lock retries can't be negative")
-
-        if (
-            self.omap_file_update_reloads
-            and self.omap_file_update_reloads < 0
-        ):
-            raise SpecValidationError("OMAP file reloads can't be negative")
-
-        if (
-            self.spdk_timeout
-            and self.spdk_timeout < 0.0
-        ):
-            raise SpecValidationError("SPDK timeout can't be negative")
-
-        if (
-            self.conn_retries
-            and self.conn_retries < 0
-        ):
-            raise SpecValidationError("Connection retries can't be negative")
-
-        if (
-            self.max_log_file_size_in_mb
-            and self.max_log_file_size_in_mb < 0
-        ):
-            raise SpecValidationError("Log file size can't be negative")
-
-        if (
-            self.max_log_files_count
-            and self.max_log_files_count < 0
-        ):
-            raise SpecValidationError("Log files count can't be negative")
-
-        if (
-            self.max_log_directory_backups
-            and self.max_log_directory_backups < 0
-        ):
-            raise SpecValidationError("Log file directory backups can't be negative")
-
-        if (
-            self.monitor_timeout
-            and self.monitor_timeout < 0.0
-        ):
-            raise SpecValidationError("Monitor timeout can't be negative")
-
-        if self.port and self.port < 0:
-            raise SpecValidationError("Port can't be negative")
-
-        if self.discovery_port and self.discovery_port < 0:
-            raise SpecValidationError("Discovery port can't be negative")
+        verify_non_negative_int(self.state_update_interval_sec, "State update interval")
+        verify_non_negative_int(self.rebalance_period_sec, "Rebalance period")
+        verify_non_negative_int(self.max_gws_in_grp, "Max gateways in group")
+        verify_non_negative_int(self.max_ns_to_change_lb_grp,
+                                "Max namespaces to change load balancing group")
+        verify_boolean(self.abort_on_errors, "Abort gateway on errors")
+        verify_boolean(self.omap_file_ignore_unlock_errors, "Ignore OMAP file unlock errors")
+        verify_boolean(self.omap_file_lock_on_read, "Lock OMAP on read")
+        verify_non_negative_int(self.omap_file_lock_duration, "OMAP file lock duration")
+        verify_non_negative_number(self.omap_file_lock_retry_sleep_interval,
+                                   "OMAP file lock sleep interval")
+        verify_non_negative_int(self.omap_file_lock_retries, "OMAP file lock retries")
+        verify_non_negative_int(self.omap_file_update_reloads, "OMAP file reloads")
+        verify_non_negative_number(self.spdk_timeout, "SPDK timeout")
+        verify_non_negative_int(self.max_log_file_size_in_mb, "Log file size")
+        verify_non_negative_int(self.max_log_files_count, "Log files count")
+        verify_non_negative_int(self.max_log_directory_backups, "Log file directory backups")
+        verify_non_negative_int(self.max_hosts_per_namespace, "Max hosts per namespace")
+        verify_non_negative_int(self.max_namespaces_with_netmask, "Max namespaces with netmask")
+        verify_positive_int(self.max_subsystems, "Max subsystems")
+        verify_positive_int(self.max_hosts, "Max hosts")
+        verify_positive_int(self.max_namespaces, "Max namespaces")
+        verify_positive_int(self.max_namespaces_per_subsystem, "Max namespaces per subsystem")
+        verify_positive_int(self.max_hosts_per_subsystem, "Max hosts per subsystem")
+        verify_non_negative_number(self.monitor_timeout, "Monitor timeout")
+        verify_non_negative_int(self.port, "Port")
+        verify_non_negative_int(self.discovery_port, "Discovery port")
+        verify_boolean(self.abort_discovery_on_errors, "Abort discovery service on errors")
+        verify_non_negative_int(self.prometheus_port, "Prometheus port")
+        verify_non_negative_int(self.prometheus_stats_interval, "Prometheus stats interval")
+        verify_boolean(self.state_update_notify, "State update notify")
+        verify_boolean(self.enable_spdk_discovery_controller, "Enable SPDK discovery controller")
+        verify_boolean(self.enable_prometheus_exporter, "Enable Prometheus exporter")
+        verify_boolean(self.verify_nqns, "Verify NQNs")
+        verify_boolean(self.verify_keys, "Verify Keys")
+        verify_boolean(self.verify_listener_ip, "Verify listener IP address")
+        verify_boolean(self.log_files_enabled, "Log files enabled")
+        verify_boolean(self.log_files_rotation_enabled, "Log files rotation enabled")
+        verify_boolean(self.verbose_log_messages, "Verbose log messages")
+        verify_boolean(self.enable_monitor_client, "Enable monitor client")
+        verify_positive_int(self.spdk_mem_size, "SPDK memory size")
+        verify_positive_int(self.spdk_huge_pages, "SPDK huge pages count")
+        if self.spdk_mem_size and self.spdk_huge_pages:
+            raise SpecValidationError(
+                '"spdk_mem_size" and "spdk_huge_pages" are mutually exclusive'
+                )
 
 
 yaml.add_representer(NvmeofServiceSpec, ServiceSpec.yaml_representer)
@@ -1815,11 +1944,11 @@ class MgmtGatewaySpec(ServiceSpec):
                  config: Optional[Dict[str, str]] = None,
                  networks: Optional[List[str]] = None,
                  placement: Optional[PlacementSpec] = None,
-                 disable_https: Optional[bool] = False,
+                 ssl: Optional[bool] = True,
                  enable_auth: Optional[bool] = False,
                  port: Optional[int] = None,
-                 ssl_certificate: Optional[str] = None,
-                 ssl_certificate_key: Optional[str] = None,
+                 ssl_cert: Optional[str] = None,
+                 ssl_key: Optional[str] = None,
                  ssl_prefer_server_ciphers: Optional[str] = None,
                  ssl_session_tickets: Optional[str] = None,
                  ssl_session_timeout: Optional[str] = None,
@@ -1848,16 +1977,16 @@ class MgmtGatewaySpec(ServiceSpec):
             extra_entrypoint_args=extra_entrypoint_args,
             custom_configs=custom_configs
         )
-        #: Is a flag to disable HTTPS. If True, the server will use unsecure HTTP
-        self.disable_https = disable_https
+        #: Is a flag to enable/disable HTTPS. By default set to True.
+        self.ssl = ssl
         #: Is a flag to enable SSO auth. Requires oauth2-proxy to be active for SSO authentication.
         self.enable_auth = enable_auth
         #: The port number on which the server will listen
         self.port = port
         #: A multi-line string that contains the SSL certificate
-        self.ssl_certificate = ssl_certificate
+        self.ssl_cert = ssl_cert
         #: A multi-line string that contains the SSL key
-        self.ssl_certificate_key = ssl_certificate_key
+        self.ssl_key = ssl_key
         #: Prefer server ciphers over client ciphers: on | off
         self.ssl_prefer_server_ciphers = ssl_prefer_server_ciphers
         #: A multioption flag to control session tickets: on | off
@@ -1876,8 +2005,9 @@ class MgmtGatewaySpec(ServiceSpec):
         self.ssl_protocols = ssl_protocols
         #: List of supported secure SSL ciphers. Changing this list may reduce system security.
         self.ssl_ciphers = ssl_ciphers
-        self.enable_health_check_endpoint = enable_health_check_endpoint
+        #: Virtual IP address used for the management gateway in a high availability setup.
         self.virtual_ip = virtual_ip
+        self.enable_health_check_endpoint = enable_health_check_endpoint
 
     def get_port_start(self) -> List[int]:
         ports = []
@@ -1888,8 +2018,8 @@ class MgmtGatewaySpec(ServiceSpec):
     def validate(self) -> None:
         super(MgmtGatewaySpec, self).validate()
         self._validate_port(self.port)
-        self._validate_certificate(self.ssl_certificate, "ssl_certificate")
-        self._validate_private_key(self.ssl_certificate_key, "ssl_certificate_key")
+        self._validate_certificate(self.ssl_cert, "ssl_cert")
+        self._validate_private_key(self.ssl_key, "ssl_key")
         self._validate_boolean_switch(self.ssl_prefer_server_ciphers, "ssl_prefer_server_ciphers")
         self._validate_boolean_switch(self.ssl_session_tickets, "ssl_session_tickets")
         self._validate_session_timeout(self.ssl_session_timeout)
@@ -1958,8 +2088,8 @@ class OAuth2ProxySpec(ServiceSpec):
                  oidc_issuer_url: Optional[str] = None,
                  redirect_url: Optional[str] = None,
                  cookie_secret: Optional[str] = None,
-                 ssl_certificate: Optional[str] = None,
-                 ssl_certificate_key: Optional[str] = None,
+                 ssl_cert: Optional[str] = None,
+                 ssl_key: Optional[str] = None,
                  allowlist_domains: Optional[List[str]] = None,
                  unmanaged: bool = False,
                  extra_container_args: Optional[GeneralArgList] = None,
@@ -1991,15 +2121,21 @@ class OAuth2ProxySpec(ServiceSpec):
         self.redirect_url = redirect_url
         #: The secret key used for signing cookies. Its length must be 16,
         # 24, or 32 bytes to create an AES cipher.
-        self.cookie_secret = cookie_secret
+        self.cookie_secret = cookie_secret or self.generate_random_secret()
         #: The multi-line SSL certificate for encrypting communications.
-        self.ssl_certificate = ssl_certificate
+        self.ssl_cert = ssl_cert
         #: The multi-line SSL certificate private key for decrypting communications.
-        self.ssl_certificate_key = ssl_certificate_key
+        self.ssl_key = ssl_key
         #: List of allowed domains for safe redirection after login or logout,
         # preventing unauthorized redirects.
         self.allowlist_domains = allowlist_domains
         self.unmanaged = unmanaged
+
+    def generate_random_secret(self) -> str:
+        import base64
+        random_bytes = os.urandom(32)
+        base64_secret = base64.urlsafe_b64encode(random_bytes).decode('utf-8')
+        return base64_secret
 
     def get_port_start(self) -> List[int]:
         ports = [4180]
@@ -2322,6 +2458,7 @@ class AlertManagerSpec(MonitoringSpec):
                  user_data: Optional[Dict[str, Any]] = None,
                  config: Optional[Dict[str, str]] = None,
                  networks: Optional[List[str]] = None,
+                 only_bind_port_on_networks: bool = False,
                  port: Optional[int] = None,
                  secure: bool = False,
                  extra_container_args: Optional[GeneralArgList] = None,
@@ -2352,6 +2489,7 @@ class AlertManagerSpec(MonitoringSpec):
         #                        <webhook_configs> configuration.
         self.user_data = user_data or {}
         self.secure = secure
+        self.only_bind_port_on_networks = only_bind_port_on_networks
 
     def get_port_start(self) -> List[int]:
         return [self.get_port(), 9094]
@@ -2398,7 +2536,7 @@ class GrafanaSpec(MonitoringSpec):
         self.protocol = protocol
 
         # whether ports daemons for this service bind to should
-        # bind to only hte networks listed in networks param, or
+        # bind to only the networks listed in networks param, or
         # to all networks. Defaults to false which is saying to bind
         # on all networks.
         self.only_bind_port_on_networks = only_bind_port_on_networks
@@ -2859,7 +2997,7 @@ class CephExporterSpec(ServiceSpec):
             extra_entrypoint_args=extra_entrypoint_args)
 
         self.service_type = service_type
-        self.sock_dir = sock_dir
+        self.sock_dir = None
         self.addrs = addrs
         self.port = port
         self.prio_limit = prio_limit
@@ -2870,6 +3008,11 @@ class CephExporterSpec(ServiceSpec):
 
     def validate(self) -> None:
         super(CephExporterSpec, self).validate()
+
+        if self.sock_dir and self.sock_dir != '/var/run/ceph/':
+            raise SpecValidationError(
+                'sock_dir setting is deprecated and must be either unset or set to /var/run/ceph/'
+            )
 
         if not isinstance(self.prio_limit, int):
             raise SpecValidationError(
@@ -3004,7 +3147,7 @@ class SMBClusterPublicIPSpec:
 
 class SMBSpec(ServiceSpec):
     service_type = 'smb'
-    _valid_features = {'domain', 'clustered'}
+    _valid_features = {'domain', 'clustered', 'cephfs-proxy'}
     _default_cluster_meta_obj = 'cluster.meta.json'
     _default_cluster_lock_obj = 'cluster.meta.lock'
 
@@ -3135,6 +3278,13 @@ class SMBSpec(ServiceSpec):
         parts[-1] = objname
         uri = 'rados://' + '/'.join(parts)
         return uri
+
+    def get_port_start(self) -> List[int]:
+        ports = [445, 9922]  # SMB service runs on port 445 and smbmetrics uses 9922
+        if 'clustered' in self.features:
+            # ctdb uses port 4379
+            ports.append(4379)
+        return ports
 
     def strict_cluster_ip_specs(self) -> List[Dict[str, Any]]:
         return [s.to_strict() for s in (self.cluster_public_addrs or [])]

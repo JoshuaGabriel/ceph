@@ -13,6 +13,7 @@ if(WIN32)
 endif()
 
 add_subdirectory(io_exerciser)
+add_subdirectory(json)
 add_subdirectory(options)
 
 set(common_srcs
@@ -103,7 +104,8 @@ set(common_srcs
   pretty_binary.cc
   utf8.c
   util.cc
-  version.cc)
+  version.cc
+  tcp_info.cc)
 
 if(WITH_SYSTEMD)
   list(APPEND common_srcs

@@ -17,6 +17,7 @@
 #include <seastar/util/closeable.hh>
 #include <seastar/util/defer.hh>
 #include <seastar/util/std-compat.hh>
+#include <seastar/core/signal.hh>
 
 #include "auth/KeyRing.h"
 #include "common/ceph_argparse.h"
@@ -24,6 +25,7 @@
 #include "crimson/common/buffer_io.h"
 #include "crimson/common/config_proxy.h"
 #include "crimson/common/fatal_signal.h"
+#include "crimson/common/perf_counters_collection.h"
 #include "crimson/mon/MonClient.h"
 #include "crimson/net/Messenger.h"
 #include "crimson/osd/stop_signal.h"
@@ -160,7 +162,7 @@ int main(int argc, const char* argv[])
           }
           // just ignore SIGHUP, we don't reread settings. keep in mind signals
           // handled by S* must be blocked for alien threads (see AlienStore).
-          seastar::engine().handle_signal(SIGHUP, [] {});
+          seastar::handle_signal(SIGHUP, [] {});
 
           // start prometheus API server
           seastar::httpd::http_server_control prom_server;
@@ -201,7 +203,7 @@ int main(int argc, const char* argv[])
                                                    true);
           }
           auto store = crimson::os::FuturizedStore::create(
-            local_conf().get_val<std::string>("osd_objectstore"),
+            local_conf().get_val<std::string>("crimson_osd_objectstore"),
             local_conf().get_val<std::string>("osd_data"),
             local_conf().get_config_values());
 

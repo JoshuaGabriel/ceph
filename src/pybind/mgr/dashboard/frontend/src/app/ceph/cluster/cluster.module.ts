@@ -11,10 +11,12 @@ import {
   GridModule,
   ProgressIndicatorModule,
   InputModule,
-  ModalModule
+  ModalModule,
+  TreeviewModule,
+  ListModule,
+  ToggletipModule
 } from 'carbon-components-angular';
 
-import { TreeModule } from '@circlon/angular-tree-component';
 import {
   NgbActiveModal,
   NgbDatepickerModule,
@@ -26,7 +28,7 @@ import {
   NgbTooltipModule,
   NgbTypeaheadModule
 } from '@ng-bootstrap/ng-bootstrap';
-import { NgxPipeFunctionModule } from 'ngx-pipe-function';
+import { PipesModule } from '~/app/shared/pipes/pipes.module';
 
 import { SharedModule } from '~/app/shared/shared.module';
 import { PerformanceCounterModule } from '../performance-counter/performance-counter.module';
@@ -91,12 +93,12 @@ import { MultiClusterDetailsComponent } from './multi-cluster/multi-cluster-deta
     MgrModulesModule,
     NgbTypeaheadModule,
     NgbTimepickerModule,
-    TreeModule,
+    TreeviewModule,
     CephSharedModule,
     NgbDatepickerModule,
     NgbPopoverModule,
     NgbDropdownModule,
-    NgxPipeFunctionModule,
+    PipesModule,
     NgbProgressbarModule,
     DashboardV3Module,
     ComboBoxModule,
@@ -106,10 +108,11 @@ import { MultiClusterDetailsComponent } from './multi-cluster/multi-cluster-deta
     ProgressIndicatorModule,
     ButtonModule,
     InputModule,
-    ModalModule
+    ModalModule,
+    ListModule,
+    ToggletipModule
   ],
   declarations: [
-    HostsComponent,
     MonitorComponent,
     ConfigurationComponent,
     OsdListComponent,
@@ -153,7 +156,8 @@ import { MultiClusterDetailsComponent } from './multi-cluster/multi-cluster-deta
     MultiClusterComponent,
     MultiClusterFormComponent,
     MultiClusterListComponent,
-    MultiClusterDetailsComponent
+    MultiClusterDetailsComponent,
+    HostsComponent
   ],
   providers: [NgbActiveModal]
 })

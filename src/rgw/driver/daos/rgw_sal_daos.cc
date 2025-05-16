@@ -858,8 +858,6 @@ bool DaosZone::is_writeable() { return true; }
 
 bool DaosZone::get_redirect_endpoint(std::string* endpoint) { return false; }
 
-bool DaosZone::has_zonegroup_api(const std::string& api) const { return false; }
-
 const std::string& DaosZone::get_current_period_id() {
   return current_period->get_id();
 }
@@ -932,7 +930,7 @@ int DaosObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp,
 
 int DaosObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val,
                                  optional_yield y,
-                                 const DoutPrefixProvider* dpp) {
+                                 const DoutPrefixProvider* dpp, uint32_t flags) {
   // Get object's metadata (those stored in rgw_bucket_dir_entry)
   ldpp_dout(dpp, 20) << "DEBUG: modify_obj_attrs" << dendl;
   rgw_bucket_dir_entry ent;
@@ -942,7 +940,7 @@ int DaosObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val,
   }
 
   // Update object attrs
-  set_atomic();
+  set_atomic(true);
   attrs[attr_name] = attr_val;
 
   ret = set_dir_entry_attrs(dpp, &ent, &attrs);
@@ -1034,7 +1032,6 @@ int DaosObject::restore_obj_from_cloud(Bucket* bucket,
           rgw_bucket_dir_entry& o,
 	  CephContext* cct,
           RGWObjTier& tier_config,
-          real_time& mtime,
           uint64_t olh_epoch,
           std::optional<uint64_t> days,
           const DoutPrefixProvider* dpp, 
@@ -2320,6 +2317,12 @@ int DaosStore::cluster_stat(RGWClusterStat& stats) {
 }
 
 std::unique_ptr<Lifecycle> DaosStore::get_lifecycle(void) {
+  DAOS_NOT_IMPLEMENTED_LOG(nullptr);
+  return 0;
+}
+
+bool DaosStore::process_expired_objects(const DoutPrefixProvider *dpp,
+	       				optional_yield y) {
   DAOS_NOT_IMPLEMENTED_LOG(nullptr);
   return 0;
 }

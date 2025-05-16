@@ -28,6 +28,7 @@
 #include "messages/MOSDPGUpdateLogMissingReply.h"
 #include "messages/MOSDRepOpReply.h"
 #include "messages/MOSDScrub2.h"
+#include "messages/MOSDPGPCT.h"
 #include "messages/MPGStats.h"
 
 #include "os/Transaction.h"
@@ -53,9 +54,11 @@
 #include "crimson/osd/pg_meta.h"
 #include "crimson/osd/osd_operations/client_request.h"
 #include "crimson/osd/osd_operations/peering_event.h"
+#include "crimson/osd/osd_operations/pgpct_request.h"
 #include "crimson/osd/osd_operations/pg_advance_map.h"
 #include "crimson/osd/osd_operations/recovery_subrequest.h"
 #include "crimson/osd/osd_operations/replicated_request.h"
+#include "crimson/osd/osd_operations/replicated_request_reply.h"
 #include "crimson/osd/osd_operations/scrub_events.h"
 #include "crimson/osd/osd_operation_external_tracking.h"
 #include "crimson/crush/CrushLocation.h"
@@ -76,6 +79,8 @@ using std::vector;
 using crimson::common::local_conf;
 using crimson::os::FuturizedStore;
 
+using namespace std::string_literals;
+
 namespace crimson::osd {
 
 OSD::OSD(int id, uint32_t nonce,
@@ -95,7 +100,16 @@ OSD::OSD(int id, uint32_t nonce,
     hb_front_msgr{hb_front_msgr},
     hb_back_msgr{hb_back_msgr},
     monc{new crimson::mon::Client{*public_msgr, *this}},
-    mgrc{new crimson::mgr::Client{*public_msgr, *this}},
+    mgrc{new crimson::mgr::Client{
+      *public_msgr,
+      *this,
+      [this](const ConfigPayload &config_payload) {
+	return set_perf_queries(config_payload);
+      },
+      [this] {
+	return get_perf_reports();
+      }
+    }},
     store{store},
     pg_shard_manager{osd_singleton_state,
                      shard_services,
@@ -105,6 +119,7 @@ OSD::OSD(int id, uint32_t nonce,
       std::ignore = update_heartbeat_peers(
       ).then([this] {
 	update_stats();
+        mgrc->update_daemon_health(get_health_metrics());
 	tick_timer.arm(
 	  std::chrono::seconds(TICK_INTERVAL));
       });
@@ -175,6 +190,70 @@ seastar::future<> OSD::open_meta_coll()
   });
 }
 
+seastar::future<> OSD::set_perf_queries(const ConfigPayload &config_payload) {
+  LOG_PREFIX(OSD::set_perf_queries);
+  const OSDConfigPayload &osd_config_payload =
+    std::get<OSDConfigPayload>(config_payload);
+  const std::map<OSDPerfMetricQuery, OSDPerfMetricLimits> &queries =
+    osd_config_payload.config;
+  DEBUG("setting {} queries", queries.size());
+
+  std::list<OSDPerfMetricQuery> supported_queries;
+  for (auto &it : queries) {
+    auto &query = it.first;
+    if (!query.key_descriptor.empty()) {
+      supported_queries.push_back(query);
+    }
+  }
+  if (supported_queries.size() < queries.size()) {
+    DEBUG("{} unsupported queries", queries.size() - supported_queries.size());
+  }
+
+  return shard_services.invoke_on_all(
+    [supported_queries, queries](auto &local_service) {
+    auto &pgs = local_service.local_state.pg_map.get_pgs();
+    local_service.local_state.m_perf_queries = supported_queries;
+    local_service.local_state.m_perf_limits = queries;
+    for (auto &[id, pg] : pgs) {
+      pg->set_dynamic_perf_stats_queries(supported_queries);
+    }
+  });
+}
+
+seastar::future<MetricPayload> OSD::get_perf_reports() {
+  LOG_PREFIX(OSD::get_perf_reports);
+  OSDMetricPayload payload;
+  std::map<OSDPerfMetricQuery, OSDPerfMetricReport> &reports = payload.report;
+
+  auto dps = co_await shard_services.map_reduce0(
+    [FNAME](auto &local_service) {
+      auto &pgs = local_service.local_state.pg_map.get_pgs();
+      auto &m_perf_queries = local_service.local_state.m_perf_queries;
+      DynamicPerfStats dps;
+      for (auto &[id, pg] : pgs) {
+	// m_perf_queries can be modified only in set_perf_queries by mgr client
+	// request, and it is protected by by mgr client's lock, which is held
+	// when set_perf_queries/get_perf_reports are called, so we may not hold
+	// m_perf_queries_lock here.
+	DynamicPerfStats pg_dps(m_perf_queries);
+	pg->get_dynamic_perf_stats(&pg_dps);
+	dps.merge(pg_dps);
+	DEBUG("reporting for pg {}", pg->get_pgid());
+      }
+      return dps;
+    },
+    DynamicPerfStats(shard_services.local().local_state.m_perf_queries),
+    [](auto left, auto right) {
+      left.merge(right);
+      return left;
+    });
+
+  dps.add_to_reports(shard_services.local().local_state.m_perf_limits, &reports);
+  DEBUG("reports for {} queries", reports.size());
+
+  co_return payload;
+}
+
 seastar::future<OSDMeta> OSD::open_or_create_meta_coll(FuturizedStore &store)
 {
   return store.get_sharded_store().open_collection(coll_t::meta()).then([&store](auto ch) {
@@ -202,18 +281,16 @@ seastar::future<> OSD::mkfs(
   co_await store.start();
 
   co_await store.mkfs(osd_uuid).handle_error(
-    crimson::stateful_ec::assert_failure([FNAME] (const auto& ec) {
-      ERROR("error creating empty object store in {}: ({}) {}",
-	    local_conf().get_val<std::string>("osd_data"),
-	    ec.value(), ec.message());
-    }));
+    crimson::stateful_ec::assert_failure(fmt::format(
+      "{} error creating empty object store in {}",
+       FNAME, local_conf().get_val<std::string>("osd_data")).c_str())
+  );
 
   co_await store.mount().handle_error(
-    crimson::stateful_ec::assert_failure([FNAME](const auto& ec) {
-      ERROR("error mounting object store in {}: ({}) {}",
-	    local_conf().get_val<std::string>("osd_data"),
-	    ec.value(), ec.message());
-    }));
+    crimson::stateful_ec::assert_failure(fmt::format(
+      "{} error mounting object store in {}",
+      FNAME, local_conf().get_val<std::string>("osd_data")).c_str())
+  );
 
   {
     auto meta_coll = co_await open_or_create_meta_coll(store);
@@ -399,11 +476,10 @@ seastar::future<> OSD::start()
 	whoami, get_shard_services(),
 	*monc, *hb_front_msgr, *hb_back_msgr});
     return store.mount().handle_error(
-      crimson::stateful_ec::assert_failure([FNAME] (const auto& ec) {
-        ERROR("error mounting object store in {}: ({}) {}",
-	      local_conf().get_val<std::string>("osd_data"),
-	      ec.value(), ec.message());
-      }));
+      crimson::stateful_ec::assert_failure(fmt::format(
+        "{} error mounting object store in {}",
+        FNAME, local_conf().get_val<std::string>("osd_data")).c_str())
+    );
   }).then([this, FNAME] {
     auto stats_seconds = local_conf().get_val<int64_t>("crimson_osd_stat_interval");
     if (stats_seconds > 0) {
@@ -504,6 +580,8 @@ seastar::future<> OSD::start()
   }).then_unpack([this] {
     return _add_me_to_crush();
   }).then([this] {
+    return _add_device_class();
+   }).then([this] {
     monc->sub_want("osd_pg_creates", last_pg_create_epoch, 0);
     monc->sub_want("mgrmap", 0, 0);
     monc->sub_want("osdmap", 0, 0);
@@ -606,6 +684,38 @@ seastar::future<> OSD::_send_boot()
   // OSDMap flag
   m->metadata["osd_type"] = "crimson";
   return monc->send_message(std::move(m));
+}
+
+seastar::future<> OSD::_add_device_class()
+{
+  LOG_PREFIX(OSD::_add_device_class);
+  if (!local_conf().get_val<bool>("osd_class_update_on_start")) {
+    co_return;
+  }
+
+  std::string device_class = co_await store.get_default_device_class();
+  if (device_class.empty()) {
+    WARN("Device class is empty; skipping crush update.");
+    co_return;
+  }
+
+  INFO("device_class is {} ", device_class);
+
+  std::string cmd = fmt::format(
+    R"({{"prefix": "osd crush set-device-class", "class": "{}", "ids": ["{}"]}})",
+    device_class, stringify(whoami)
+  );
+
+  auto [code, message, out] = co_await monc->run_command(std::move(cmd), {});
+  if (code) {
+    // to be caught by crimson/osd/main.cc
+    WARN("fail to set device_class : {} ({})", message, code);
+    throw std::runtime_error("fail to set device_class");
+  } else {
+    INFO("device_class was set: {}", message);
+  }
+
+  co_return;
 }
 
 seastar::future<> OSD::_add_me_to_crush()
@@ -884,6 +994,9 @@ OSD::do_ms_dispatch(
   case MSG_OSD_PG_UPDATE_LOG_MISSING_REPLY:
     return handle_update_log_missing_reply(conn, boost::static_pointer_cast<
       MOSDPGUpdateLogMissingReply>(m));
+  case MSG_OSD_PG_PCT:
+    return handle_pg_pct(conn, boost::static_pointer_cast<
+      MOSDPGPCT>(m));
   default:
     return std::nullopt;
   }
@@ -929,20 +1042,16 @@ void OSD::handle_authentication(const EntityName& name,
   }
 }
 
-const char** OSD::get_tracked_conf_keys() const
+std::vector<std::string> OSD::get_tracked_keys() const noexcept
 {
-  static const char* KEYS[] = {
-    "osd_beacon_report_interval",
-    nullptr
-  };
-  return KEYS;
+  return {"osd_beacon_report_interval"s};
 }
 
 void OSD::handle_conf_change(
   const crimson::common::ConfigProxy& conf,
   const std::set <std::string> &changed)
 {
-  if (changed.count("osd_beacon_report_interval")) {
+  if (changed.contains("osd_beacon_report_interval")) {
     beacon_timer.rearm_periodic(
       std::chrono::seconds(conf->osd_beacon_report_interval));
   }
@@ -1293,47 +1402,45 @@ seastar::future<> OSD::handle_update_log_missing(
   crimson::net::ConnectionRef conn,
   Ref<MOSDPGUpdateLogMissing> m)
 {
-  return pg_shard_manager.start_pg_operation<LogMissingRequest>(
+  return pg_shard_manager.start_pg_operation_active<LogMissingRequest>(
     std::move(conn),
-    std::move(m)).second;
+    std::move(m));
 }
 
 seastar::future<> OSD::handle_update_log_missing_reply(
   crimson::net::ConnectionRef conn,
   Ref<MOSDPGUpdateLogMissingReply> m)
 {
-  return pg_shard_manager.start_pg_operation<LogMissingRequestReply>(
+  return pg_shard_manager.start_pg_operation_active<LogMissingRequestReply>(
     std::move(conn),
-    std::move(m)).second;
+    std::move(m));
+}
+
+seastar::future<> OSD::handle_pg_pct(
+  crimson::net::ConnectionRef conn,
+  Ref<MOSDPGPCT> m)
+{
+  return pg_shard_manager.start_pg_operation_active<PGPCTRequest>(
+    std::move(conn),
+    std::move(m));
 }
 
 seastar::future<> OSD::handle_rep_op(
   crimson::net::ConnectionRef conn,
   Ref<MOSDRepOp> m)
 {
-  m->finish_decode();
-  return pg_shard_manager.start_pg_operation<RepRequest>(
+  return pg_shard_manager.start_pg_operation_active<RepRequest>(
     std::move(conn),
-    std::move(m)).second;
+    std::move(m));
 }
 
 seastar::future<> OSD::handle_rep_op_reply(
   crimson::net::ConnectionRef conn,
   Ref<MOSDRepOpReply> m)
 {
-  LOG_PREFIX(OSD::handle_rep_op_reply);
-  spg_t pgid = m->get_spg();
-  return pg_shard_manager.with_pg(
-    pgid,
-    [FNAME, m=std::move(m)](auto &&pg) {
-      if (pg) {
-	m->finish_decode();
-	pg->handle_rep_op_reply(*m);
-      } else {
-	WARN("stale reply: {}", *m);
-      }
-      return seastar::now();
-    });
+  return pg_shard_manager.start_pg_operation_active<ReplicatedRequestReply>(
+    std::move(conn),
+    std::move(m));
 }
 
 seastar::future<> OSD::handle_scrub_command(
@@ -1357,9 +1464,9 @@ seastar::future<> OSD::handle_scrub_message(
   crimson::net::ConnectionRef conn,
   Ref<MOSDFastDispatchOp> m)
 {
-  return pg_shard_manager.start_pg_operation<
+  return pg_shard_manager.start_pg_operation_active<
     crimson::osd::ScrubMessage
-    >(m, conn, m->get_min_epoch(), m->get_spg()).second;
+    >(m, conn, m->get_min_epoch(), m->get_spg());
 }
 
 seastar::future<> OSD::handle_mark_me_down(
@@ -1377,8 +1484,76 @@ seastar::future<> OSD::handle_recovery_subreq(
   crimson::net::ConnectionRef conn,
   Ref<MOSDFastDispatchOp> m)
 {
-  return pg_shard_manager.start_pg_operation<RecoverySubRequest>(
-    conn, std::move(m)).second;
+  return pg_shard_manager.start_pg_operation_active<RecoverySubRequest>(
+    conn, std::move(m));
+}
+
+vector<DaemonHealthMetric> OSD::get_health_metrics()
+{
+  LOG_PREFIX(OSD::get_health_metrics);
+  vector<DaemonHealthMetric> metrics;
+
+  const utime_t now = ceph_clock_now();
+  utime_t oldest_secs = now;
+  utime_t too_old = now;
+  too_old -= local_conf()->osd_op_complaint_time;
+  int slow = 0;
+  ClientRequest::ICRef oldest_op;
+  map<uint64_t, int> slow_op_pools;
+  bool log_aggregated_slow_op = local_conf()->osd_aggregated_slow_ops_logging;
+  auto count_slow_ops = [&](const ClientRequest& op) {
+    if (op.get_started() < too_old) {
+      std::stringstream ss;
+      ss << "slow request ";
+      op.print(ss);
+      ss << " initiated "
+         << op.get_started();
+      WARN("{}", ss.str());
+      if (log_aggregated_slow_op) {
+        uint64_t pool_id = op.get_pgid().pgid.m_pool;
+        if (pool_id > 0 && pool_id <= (uint64_t) osdmap->get_pool_max()) {
+          slow_op_pools[pool_id]++;
+        }
+      } else {
+        clog->warn() << ss.str();
+      }
+      ++slow;
+      if (!oldest_op || op.get_started() < oldest_op->get_started()) {
+        oldest_op = &op;
+      }
+    }
+  };
+
+  auto& op_registry = get_shard_services().get_registry();
+  op_registry.visit_ops_in_flight(count_slow_ops);
+  if (slow) {
+    std::stringstream ss;
+    ss << __func__ << " reporting " << slow << " slow ops, oldest is ";
+    ceph_assert(oldest_op);
+    oldest_op->print(ss);
+    ERROR("{}", ss.str());
+    if (log_aggregated_slow_op && !slow_op_pools.empty()) {
+      std::stringstream ss;
+      auto slow_pool_it = std::max_element(slow_op_pools.begin(), slow_op_pools.end(),
+                             [](std::pair<uint64_t, int> p1, std::pair<uint64_t, int> p2) {
+                               return p1.second < p2.second;
+                             });
+      if (osdmap->get_pools().find(slow_pool_it->first) != osdmap->get_pools().end()) {
+        string pool_name = osdmap->get_pool_name(slow_pool_it->first);
+        ss << "slow requests (most affected pool [ '"
+           << pool_name
+           << "' : "
+           << slow_pool_it->second
+           << " ])";
+      }
+      WARN("{}", ss.str());
+      clog->warn() << ss.str();
+    }
+    oldest_secs = now - oldest_op->get_started();
+    metrics.emplace_back(daemon_metric::SLOW_OPS, slow, oldest_secs);
+  }
+
+  return metrics;
 }
 
 bool OSD::should_restart() const

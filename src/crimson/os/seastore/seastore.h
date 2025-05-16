@@ -101,7 +101,8 @@ public:
 
     seastar::future<struct stat> stat(
       CollectionRef c,
-      const ghobject_t& oid) final;
+      const ghobject_t& oid,
+      uint32_t op_flags = 0) final;
 
     read_errorator::future<ceph::bufferlist> read(
       CollectionRef c,
@@ -118,32 +119,38 @@ public:
 
     base_errorator::future<bool> exists(
       CollectionRef c,
-      const ghobject_t& oid) final;
+      const ghobject_t& oid,
+      uint32_t op_flags = 0) final;
 
     get_attr_errorator::future<ceph::bufferlist> get_attr(
       CollectionRef c,
       const ghobject_t& oid,
-      std::string_view name) const final;
+      std::string_view name,
+      uint32_t op_flags = 0) const final;
 
     get_attrs_ertr::future<attrs_t> get_attrs(
       CollectionRef c,
-      const ghobject_t& oid) final;
+      const ghobject_t& oid,
+      uint32_t op_flags = 0) final;
 
     read_errorator::future<omap_values_t> omap_get_values(
       CollectionRef c,
       const ghobject_t& oid,
-      const omap_keys_t& keys) final;
+      const omap_keys_t& keys,
+      uint32_t op_flags = 0) final;
 
     /// Retrieves paged set of values > start (if present)
     read_errorator::future<omap_values_paged_t> omap_get_values(
       CollectionRef c,           ///< [in] collection
       const ghobject_t &oid,     ///< [in] oid
-      const std::optional<std::string> &start ///< [in] start, empty for begin
+      const std::optional<std::string> &start, ///< [in] start, empty for begin
+      uint32_t op_flags = 0
       ) final; ///< @return <done, values> values.empty() iff done
 
     get_attr_errorator::future<bufferlist> omap_get_header(
       CollectionRef c,
-      const ghobject_t& oid) final;
+      const ghobject_t& oid,
+      uint32_t op_flags = 0) final;
 
     /// std::get<1>(ret) returns end if and only if the listing has listed all
     /// the items within the range, otherwise it returns the next key to be listed.
@@ -151,7 +158,8 @@ public:
       CollectionRef c,
       const ghobject_t& start,
       const ghobject_t& end,
-      uint64_t limit) const final;
+      uint64_t limit,
+      uint32_t op_flags = 0) const final;
 
     seastar::future<CollectionRef> create_new_collection(const coll_t& cid) final;
     seastar::future<CollectionRef> open_collection(const coll_t& cid) final;
@@ -170,11 +178,14 @@ public:
       CollectionRef ch,
       const ghobject_t& oid,
       uint64_t off,
-      uint64_t len) final;
+      uint64_t len,
+      uint32_t op_flags = 0) final;
 
     unsigned get_max_attr_name_length() const final {
       return 256;
     }
+
+    omap_root_t select_log_omap_root(Onode& onode) const;
 
   // only exposed to SeaStore
   public:
@@ -190,6 +201,8 @@ public:
 
     seastar::future<> write_meta(const std::string& key,
                                  const std::string& value);
+
+    seastar::future<std::string> get_default_device_class();
 
     store_statfs_t stat() const;
 
@@ -249,7 +262,8 @@ public:
       return seastar::do_with(
         internal_context_t(
           ch, std::move(t),
-          transaction_manager->create_transaction(src, tname)),
+          transaction_manager->create_transaction(
+	    src, tname, t.get_fadvise_flags())),
         std::forward<F>(f),
         [this, op_type](auto &ctx, auto &f) {
         assert(shard_stats.starting_io_num);
@@ -296,20 +310,22 @@ public:
       Transaction::src_t src,
       const char* tname,
       op_type_t op_type,
+      cache_hint_t cache_hint_flags,
       F &&f) const {
       auto begin_time = std::chrono::steady_clock::now();
       return seastar::do_with(
         oid, Ret{}, std::forward<F>(f),
-        [this, ch, src, op_type, begin_time, tname
+        [this, ch, src, op_type, begin_time, tname, cache_hint_flags
         ](auto &oid, auto &ret, auto &f)
       {
-        return repeat_eagain([&, this, ch, src, tname] {
+        return repeat_eagain([&, this, ch, src, tname, cache_hint_flags] {
           assert(src == Transaction::src_t::READ);
           ++(shard_stats.repeat_read_num);
 
           return transaction_manager->with_transaction_intr(
             src,
             tname,
+	    cache_hint_flags,
             [&, this, ch, tname](auto& t)
           {
             LOG_PREFIX(SeaStoreS::repeat_with_onode);
@@ -332,29 +348,6 @@ public:
       });
     }
 
-    using omap_list_bare_ret = OMapManager::omap_list_bare_ret;
-    using omap_list_ret = OMapManager::omap_list_ret;
-    omap_list_ret omap_list(
-      Onode& onode,
-      const omap_root_le_t& omap_root,
-      Transaction& t,
-      const std::optional<std::string>& start,
-      OMapManager::omap_list_config_t config) const;
-
-    using _omap_get_value_iertr = base_iertr::extend<
-      crimson::ct_error::enodata
-      >;
-    using _omap_get_value_ret = _omap_get_value_iertr::future<ceph::bufferlist>;
-    _omap_get_value_ret _omap_get_value(
-      Transaction &t,
-      omap_root_t &&root,
-      std::string_view key) const;
-
-    base_iertr::future<omap_values_t> _omap_get_values(
-      Transaction &t,
-      omap_root_t &&root,
-      const omap_keys_t &keys) const;
-
     friend class SeaStoreOmapIterator;
 
     base_iertr::future<ceph::bufferlist> _read( 
@@ -364,7 +357,11 @@ public:
       std::size_t len,
       uint32_t op_flags);
 
-    _omap_get_value_ret _get_attr(
+    using omaptree_get_value_iertr = base_iertr::extend<
+      crimson::ct_error::enodata
+      >;
+    using omaptree_get_value_ret = omaptree_get_value_iertr::future<ceph::bufferlist>;
+    omaptree_get_value_ret _get_attr(
       Transaction& t,
       Onode& onode,
       std::string_view name) const;
@@ -378,16 +375,6 @@ public:
       Onode& onode,
       const ghobject_t& oid);
 
-    base_iertr::future<omap_values_t> do_omap_get_values(
-      Transaction& t,
-      Onode& onode,
-      const omap_keys_t& keys);
-
-    base_iertr::future<omap_values_paged_t> do_omap_get_values(
-      Transaction& t,
-      Onode& onode,
-      const std::optional<std::string>& start);
-
     base_iertr::future<fiemap_ret_t> _fiemap(
       Transaction &t,
       Onode &onode,
@@ -400,100 +387,59 @@ public:
       internal_context_t &ctx,
       CollectionRef &col,
       std::vector<OnodeRef> &onodes,
-      std::vector<OnodeRef> &d_onodes,
       ceph::os::Transaction::iterator &i);
 
-    tm_ret _remove_omaps(
-      internal_context_t &ctx,
-      OnodeRef &onode,
-      omap_root_t &&omap_root);
     tm_ret _remove(
       internal_context_t &ctx,
       OnodeRef &onode);
     tm_ret _touch(
       internal_context_t &ctx,
-      OnodeRef &onode);
+      Onode &onode);
     tm_ret _write(
       internal_context_t &ctx,
-      OnodeRef &onode,
+      Onode &onode,
       uint64_t offset, size_t len,
       ceph::bufferlist &&bl,
       uint32_t fadvise_flags);
-    enum class omap_type_t : uint8_t {
-      XATTR = 0,
-      OMAP,
-      NUM_TYPES
-    };
-    tm_ret _clone_omaps(
-      internal_context_t &ctx,
-      OnodeRef &onode,
-      OnodeRef &d_onode,
-      const omap_type_t otype);
     tm_ret _clone(
       internal_context_t &ctx,
-      OnodeRef &onode,
-      OnodeRef &d_onode);
+      Onode &onode,
+      Onode &d_onode);
     tm_ret _rename(
       internal_context_t &ctx,
       OnodeRef &onode,
       OnodeRef &d_onode);
     tm_ret _zero(
       internal_context_t &ctx,
-      OnodeRef &onode,
+      Onode &onode,
       objaddr_t offset, extent_len_t len);
-    tm_ret _omap_set_values(
-      internal_context_t &ctx,
-      OnodeRef &onode,
-      std::map<std::string, ceph::bufferlist> &&aset);
     tm_ret _omap_set_header(
       internal_context_t &ctx,
-      OnodeRef &onode,
+      Onode &onode,
       ceph::bufferlist &&header);
     tm_ret _omap_clear(
       internal_context_t &ctx,
-      OnodeRef &onode);
-    tm_ret _omap_rmkeys(
-      internal_context_t &ctx,
-      OnodeRef &onode,
-      omap_keys_t &&aset);
-    tm_ret _omap_rmkeyrange(
-      internal_context_t &ctx,
-      OnodeRef &onode,
-      std::string first,
-      std::string last);
+      Onode &onode);
     tm_ret _truncate(
       internal_context_t &ctx,
-      OnodeRef &onode, uint64_t size);
+      Onode &onode, uint64_t size);
     tm_ret _setattrs(
       internal_context_t &ctx,
-      OnodeRef &onode,
+      Onode &onode,
       std::map<std::string,bufferlist>&& aset);
     tm_ret _rmattr(
       internal_context_t &ctx,
-      OnodeRef &onode,
+      Onode &onode,
       std::string name);
     tm_ret _rmattrs(
       internal_context_t &ctx,
-      OnodeRef &onode);
-    tm_ret _xattr_rmattr(
-      internal_context_t &ctx,
-      OnodeRef &onode,
-      std::string &&name);
-    tm_ret _xattr_clear(
-      internal_context_t &ctx,
-      OnodeRef &onode);
+      Onode &onode);
     tm_ret _create_collection(
       internal_context_t &ctx,
       const coll_t& cid, int bits);
     tm_ret _remove_collection(
       internal_context_t &ctx,
       const coll_t& cid);
-    using omap_set_kvs_ret = tm_iertr::future<omap_root_t>;
-    omap_set_kvs_ret _omap_set_kvs(
-      const OnodeRef &onode,
-      const omap_root_le_t& omap_root,
-      Transaction& t,
-      std::map<std::string, ceph::bufferlist>&& kvs);
 
     boost::intrusive_ptr<SeastoreCollection> _get_collection(const coll_t& cid);
 
@@ -514,7 +460,91 @@ public:
       seastar::metrics::histogram& lat = get_latency(op_type);
       lat.sample_count++;
       lat.sample_sum += std::chrono::duration_cast<std::chrono::milliseconds>(dur).count();
-     }
+    }
+
+    /*
+     * omaptree interfaces
+     */
+
+    omap_root_t get_omap_root(omap_type_t type, Onode& onode) const {
+      return onode.get_root(type).get(
+        onode.get_metadata_hint(device->get_block_size()));
+    }
+
+    omap_root_t rename_omap_root(
+      omap_type_t type,
+      Onode& onode,
+      Onode& d_onode) const {
+      return onode.get_root(type).get(
+        d_onode.get_metadata_hint(device->get_block_size()));
+    }
+
+    omaptree_get_value_ret omaptree_get_value(
+      Transaction& t,
+      omap_root_t&& root,
+      std::string_view key) const;
+
+    using omaptree_list_bare_ret = OMapManager::omap_list_bare_ret;
+    using omaptree_list_ret = OMapManager::omap_list_ret;
+    omaptree_list_ret omaptree_list(
+      Transaction& t,
+      omap_root_t&& root,
+      const std::optional<std::string>& start,
+      OMapManager::omap_list_config_t config) const;
+
+    base_iertr::future<omap_values_t> omaptree_get_values(
+      Transaction& t,
+      omap_root_t&& root,
+      const omap_keys_t& keys) const;
+
+    base_iertr::future<omap_values_paged_t> omaptree_get_values(
+      Transaction& t,
+      omap_root_t&& root,
+      const std::optional<std::string>& start) const;
+
+    base_iertr::future<> omaptree_set_keys(
+      Transaction& t,
+      omap_root_t&& root,
+      Onode& onode,
+      std::map<std::string, ceph::bufferlist>&& aset);
+
+    base_iertr::future<> omaptree_rm_key(
+      Transaction& t,
+      omap_root_t&& root,
+      Onode& onode,
+      std::string&& name);
+
+    base_iertr::future<> omaptree_rm_keys(
+      Transaction& t,
+      omap_root_t&& root,
+      Onode& onode,
+      omap_keys_t&& aset);
+
+    base_iertr::future<> omaptree_rm_keyrange(
+      Transaction& t,
+      omap_root_t&& root,
+      Onode& onode,
+      std::string first,
+      std::string last);
+
+    base_iertr::future<> omaptree_clone(
+      Transaction& t,
+      omap_type_t type,
+      Onode& onode,
+      Onode& d_onode);
+
+    base_iertr::future<omap_root_t> omaptree_do_clear(
+      Transaction& t,
+      omap_root_t&& root);
+
+    base_iertr::future<> omaptree_clear_no_onode(
+      Transaction& t,
+      omap_root_t&& root);
+
+    base_iertr::future<> omaptree_clear(
+      Transaction& t,
+      omap_root_t&& root,
+      Onode& onode);
 
   private:
     std::string root;
@@ -566,6 +596,8 @@ public:
   seastar::future<std::tuple<int, std::string>> read_meta(const std::string& key) final;
 
   seastar::future<std::vector<coll_core_t>> list_collections() final;
+
+  seastar::future<std::string> get_default_device_class() final;
 
   FuturizedStore::Shard& get_sharded_store() final {
     return shard_stores.local();

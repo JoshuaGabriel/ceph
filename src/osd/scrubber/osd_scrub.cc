@@ -8,6 +8,7 @@
 #include "osdc/Objecter.h"
 
 #include "pg_scrubber.h"
+#include "common/debug.h"
 
 using namespace ::std::chrono;
 using namespace ::std::chrono_literals;
@@ -65,9 +66,8 @@ void OsdScrub::dump_scrubs(ceph::Formatter* f) const
 void OsdScrub::dump_scrub_reservations(ceph::Formatter* f) const
 {
   m_resource_bookkeeper.dump_scrub_reservations(f);
-  f->open_array_section("remote_scrub_reservations");
+  Formatter::ObjectSection rmt_section{*f, "remote_scrub_reservations"sv};
   m_osd_svc.get_scrub_reserver().dump(f);
-  f->close_section();
 }
 
 void OsdScrub::log_fwd(std::string_view text)
@@ -189,7 +189,8 @@ Scrub::OSDRestrictions OsdScrub::restrictions_on_scrubbing(
 {
   Scrub::OSDRestrictions env_conditions;
 
-  // some environmental conditions prevent all but high priority scrubs
+  // some "environmental conditions" prevent all but specific types
+  // (urgency levels) of scrubs
 
   if (!m_resource_bookkeeper.can_inc_scrubs()) {
     // our local OSD is already running too many scrubs
@@ -198,29 +199,19 @@ Scrub::OSDRestrictions OsdScrub::restrictions_on_scrubbing(
 
   } else if (scrub_random_backoff()) {
     // dice-roll says we should not scrub now
-    dout(15) << "Lost in dice. Only high priority scrubs allowed." << dendl;
+    dout(15) << "Lost on the dice. Regular scheduled scrubs are not permitted."
+	     << dendl;
     env_conditions.random_backoff_active = true;
-
-  } else if (is_recovery_active && !conf->osd_scrub_during_recovery) {
-    if (conf->osd_repair_during_recovery) {
-      dout(15)
-	  << "will only schedule explicitly requested repair due to active "
-	     "recovery"
-	  << dendl;
-      env_conditions.allow_requested_repair_only = true;
-
-    } else {
-      dout(15) << "recovery in progress. Operator-initiated scrubs only."
-	       << dendl;
-      env_conditions.recovery_in_progress = true;
-    }
-  } else {
-
-    // regular, i.e. non-high-priority scrubs are allowed
-    env_conditions.restricted_time = !scrub_time_permit(scrub_clock_now);
-    env_conditions.cpu_overloaded =
-	!m_load_tracker.scrub_load_below_threshold();
   }
+
+  if (is_recovery_active && !conf->osd_scrub_during_recovery) {
+    dout(15) << "recovery in progress. Operator-initiated scrubs only."
+	     << dendl;
+    env_conditions.recovery_in_progress = true;
+  }
+
+  env_conditions.restricted_time = !scrub_time_permit(scrub_clock_now);
+  env_conditions.cpu_overloaded = !m_load_tracker.scrub_load_below_threshold();
 
   return env_conditions;
 }
@@ -268,8 +259,7 @@ void OsdScrub::on_config_change()
 		    "updating scrub schedule on {}",
 		    (locked_pg->pg())->get_pgid())
 	     << dendl;
-    locked_pg->pg()->on_scrub_schedule_input_change(
-	Scrub::delay_ready_t::no_delay);
+    locked_pg->pg()->on_scrub_schedule_input_change();
   }
 }
 

@@ -6,15 +6,15 @@
 #include <iostream>
 
 #include <boost/intrusive/list.hpp>
+#include <boost/intrusive/set.hpp>
 #include <boost/intrusive_ptr.hpp>
 #include <boost/smart_ptr/intrusive_ref_counter.hpp>
 
 #include "seastar/core/shared_future.hh"
 
 #include "include/buffer.h"
-#include "crimson/common/errorator.h"
-#include "crimson/common/interruptible_future.h"
 #include "crimson/os/seastore/seastore_types.h"
+#include "crimson/os/seastore/transaction_interruptor.h"
 
 struct btree_lba_manager_test;
 struct lba_btree_test;
@@ -23,15 +23,11 @@ struct cache_test_t;
 
 namespace crimson::os::seastore {
 
-class Transaction;
 class CachedExtent;
 using CachedExtentRef = boost::intrusive_ptr<CachedExtent>;
 class SegmentedAllocator;
 class TransactionManager;
 class ExtentPlacementManager;
-
-template <typename, typename>
-class BtreeNodeMapping;
 
 // #define DEBUG_CACHED_EXTENT_REF
 #ifdef DEBUG_CACHED_EXTENT_REF
@@ -40,6 +36,20 @@ void intrusive_ptr_add_ref(CachedExtent *);
 void intrusive_ptr_release(CachedExtent *);
 
 #endif
+
+// Note: BufferSpace::to_full_ptr() also creates extent ptr.
+
+inline ceph::bufferptr create_extent_ptr_rand(extent_len_t len) {
+  assert(is_aligned(len, CEPH_PAGE_SIZE));
+  assert(len > 0);
+  return ceph::bufferptr(buffer::create_page_aligned(len));
+}
+
+inline ceph::bufferptr create_extent_ptr_zero(extent_len_t len) {
+  auto bp = create_extent_ptr_rand(len);
+  bp.zero();
+  return bp;
+}
 
 template <typename T>
 using TCachedExtentRef = boost::intrusive_ptr<T>;
@@ -64,7 +74,7 @@ class read_set_item_t {
     &read_set_item_t::trans_hook>;
 
 public:
-  struct cmp_t {
+  struct extent_cmp_t {
     using is_transparent = paddr_t;
     bool operator()(const read_set_item_t<T> &lhs, const read_set_item_t &rhs) const;
     bool operator()(const paddr_t &lhs, const read_set_item_t<T> &rhs) const;
@@ -103,10 +113,14 @@ public:
   read_set_item_t(read_set_item_t &&) = default;
   ~read_set_item_t() = default;
 };
+
 template <typename T>
-using read_set_t = std::set<
+using read_extent_set_t = std::set<
   read_set_item_t<T>,
-  typename read_set_item_t<T>::cmp_t>;
+  typename read_set_item_t<T>::extent_cmp_t>;
+
+template <typename T>
+using read_trans_set_t = typename read_set_item_t<T>::trans_set_t;
 
 struct trans_spec_view_t {
   // if the extent is pending, contains the id of the owning transaction;
@@ -153,6 +167,85 @@ struct trans_spec_view_t {
     trans_view_member_options,
     boost::intrusive::constant_time_size<false>,
     boost::intrusive::compare<cmp_t>>;
+};
+
+struct load_range_t {
+  extent_len_t offset;
+  ceph::bufferptr ptr;
+
+  extent_len_t get_length() const {
+    return ptr.length();
+  }
+
+  extent_len_t get_end() const {
+    extent_len_t end = offset + ptr.length();
+    assert(end > offset);
+    return end;
+  }
+};
+struct load_ranges_t {
+  extent_len_t length = 0;
+  std::list<load_range_t> ranges;
+
+  void push_back(extent_len_t offset, ceph::bufferptr ptr) {
+    assert(ranges.empty() ||
+           (ranges.back().get_end() < offset));
+    assert(ptr.length());
+    length += ptr.length();
+    ranges.push_back({offset, std::move(ptr)});
+  }
+};
+
+/// manage small chunks of extent
+class BufferSpace {
+  using map_t = std::map<extent_len_t, ceph::bufferlist>;
+public:
+  BufferSpace() = default;
+
+  /// Returns true if offset~length is fully loaded
+  bool is_range_loaded(extent_len_t offset, extent_len_t length) const;
+
+  /// Returns the bufferlist of offset~length
+  ceph::bufferlist get_buffer(extent_len_t offset, extent_len_t length) const;
+
+  /// Returns the ranges to load, merge the buffer_map if possible
+  load_ranges_t load_ranges(extent_len_t offset, extent_len_t length);
+
+  /// Converts to ptr when fully loaded
+  ceph::bufferptr to_full_ptr(extent_len_t length);
+
+private:
+  // create and append the read-hole to
+  // load_ranges_t and bl
+  static void create_hole_append_bl(
+      load_ranges_t& ret,
+      ceph::bufferlist& bl,
+      extent_len_t hole_offset,
+      extent_len_t hole_length) {
+    ceph::bufferptr hole_ptr = create_extent_ptr_rand(hole_length);
+    bl.append(hole_ptr);
+    ret.push_back(hole_offset, std::move(hole_ptr));
+  }
+
+  // create and insert the read-hole to buffer_map,
+  // and append to load_ranges_t
+  // returns the iterator containing the inserted read-hole
+  auto create_hole_insert_map(
+      load_ranges_t& ret,
+      extent_len_t hole_offset,
+      extent_len_t hole_length,
+      const map_t::const_iterator& next_it) {
+    assert(!buffer_map.contains(hole_offset));
+    ceph::bufferlist bl;
+    create_hole_append_bl(ret, bl, hole_offset, hole_length);
+    auto it = buffer_map.insert(
+        next_it, std::pair{hole_offset, std::move(bl)});
+    assert(next_it == std::next(it));
+    return it;
+  }
+
+  /// extent offset -> buffer, won't overlap nor contiguous
+  map_t buffer_map;
 };
 
 class ExtentIndex;
@@ -256,6 +349,17 @@ public:
   virtual void on_initial_write() {}
 
   /**
+   * on_fully_loaded
+   *
+   * Called when ptr is ready. Normally this should be used to initiate
+   * the extent to be identical to CachedExtent(ptr).
+   *
+   * Note this doesn't mean the content is fully read, use on_clean_read for
+   * this purpose.
+   */
+  virtual void on_fully_loaded() {}
+
+  /**
    * on_clean_read
    *
    * Called after read of initially written extent.
@@ -303,6 +407,8 @@ public:
   virtual extent_types_t get_type() const = 0;
 
   virtual bool is_logical() const {
+    assert(!is_logical_type(get_type()));
+    assert(is_physical_type(get_type()));
     return false;
   }
 
@@ -350,12 +456,12 @@ public:
 	<< ", modify_time=" << sea_time_point_printer_t{modify_time}
 	<< ", paddr=" << get_paddr()
 	<< ", prior_paddr=" << prior_poffset_str
-	<< std::hex << ", length=0x" << get_length() << std::dec
+	<< std::hex << ", length=0x" << get_length()
+	<< ", loaded=0x" << get_loaded_length() << std::dec
 	<< ", state=" << state
 	<< ", last_committed_crc=" << last_committed_crc
 	<< ", refcount=" << use_count()
 	<< ", user_hint=" << user_hint
-	<< ", fully_loaded=" << is_fully_loaded()
 	<< ", rewrite_gen=" << rewrite_gen_printer_t{rewrite_generation};
     if (state != extent_state_t::INVALID &&
         state != extent_state_t::CLEAN_PENDING) {
@@ -537,7 +643,40 @@ public:
   /// Return true if extent is fully loaded or is about to be fully loaded (call 
   /// wait_io() in this case)
   bool is_fully_loaded() const {
-    return ptr.has_value();
+    if (ptr.has_value()) {
+      // length == 0 iff root
+      assert(length == loaded_length);
+      assert(!buffer_space.has_value());
+      return true;
+    } else { // ptr is std::nullopt
+      assert(length > loaded_length);
+      assert(buffer_space.has_value());
+      return false;
+    }
+  }
+
+  /// Return true if range offset~_length is loaded
+  bool is_range_loaded(extent_len_t offset, extent_len_t _length) {
+    assert(is_aligned(offset, CEPH_PAGE_SIZE));
+    assert(is_aligned(_length, CEPH_PAGE_SIZE));
+    assert(_length > 0);
+    assert(offset + _length <= length);
+    if (is_fully_loaded()) {
+      return true;
+    }
+    return buffer_space->is_range_loaded(offset, _length);
+  }
+
+  /// Get buffer by given offset and _length.
+  ceph::bufferlist get_range(extent_len_t offset, extent_len_t _length) {
+    assert(is_range_loaded(offset, _length));
+    ceph::bufferlist res;
+    if (is_fully_loaded()) {
+      res.append(ceph::bufferptr(get_bptr(), offset, _length));
+    } else {
+      res = buffer_space->get_buffer(offset, _length);
+    }
+    return res;
   }
 
   /**
@@ -553,12 +692,9 @@ public:
     return length;
   }
 
+  /// Returns length of partially loaded extent data in cache
   extent_len_t get_loaded_length() const {
-    if (ptr.has_value()) {
-      return ptr->length();
-    } else {
-      return 0;
-    }
+    return loaded_length;
   }
 
   /// Returns version, get_version() == 0 iff is_clean()
@@ -624,7 +760,7 @@ public:
   }
 
   bool is_inline() const {
-    return poffset.is_relative();
+    return poffset.is_record_relative();
   }
 
   paddr_t get_prior_paddr_and_reset() {
@@ -697,11 +833,18 @@ private:
    */
   journal_seq_t dirty_from_or_retired_at;
 
-  /// cache data contents, std::nullopt if no data in cache
+  /// cache data contents, std::nullopt iff partially loaded
   std::optional<ceph::bufferptr> ptr;
 
-  /// disk data length
+  /// disk data length, 0 iff root
   extent_len_t length;
+
+  /// loaded data length, <length iff partially loaded
+  extent_len_t loaded_length;
+
+  /// manager of buffer pieces for ObjectDataBLock
+  /// valid iff partially loaded
+  std::optional<BufferSpace> buffer_space;
 
   /// number of deltas since initial write
   extent_version_t version = 0;
@@ -714,10 +857,12 @@ private:
 
   /// used to wait while in-progress commit completes
   std::optional<seastar::shared_promise<>> io_wait_promise;
+
   void set_io_wait() {
     ceph_assert(!io_wait_promise);
     io_wait_promise = seastar::shared_promise<>();
   }
+
   void complete_io() {
     ceph_assert(io_wait_promise);
     io_wait_promise->set_value();
@@ -735,7 +880,7 @@ private:
   CachedExtent* get_transactional_view(Transaction &t);
   CachedExtent* get_transactional_view(transaction_id_t tid);
 
-  read_set_item_t<Transaction>::trans_set_t transactions;
+  read_trans_set_t<Transaction> read_transactions;
 
   placement_hint_t user_hint = PLACEMENT_HINT_NULL;
 
@@ -744,13 +889,33 @@ private:
   rewrite_gen_t rewrite_generation = NULL_GENERATION;
 
 protected:
-  trans_view_set_t mutation_pendings;
+  trans_view_set_t mutation_pending_extents;
   trans_view_set_t retired_transactions;
 
   CachedExtent(CachedExtent &&other) = delete;
-  CachedExtent(ceph::bufferptr &&_ptr) : ptr(std::move(_ptr)) {
-    length = ptr->length();
+
+  /// construct a fully loaded CachedExtent
+  explicit CachedExtent(ceph::bufferptr &&_ptr)
+    : length(_ptr.length()),
+      loaded_length(_ptr.length()) {
+    ptr = std::move(_ptr);
+
+    assert(ptr->is_page_aligned());
     assert(length > 0);
+    assert(is_fully_loaded());
+    // must call init() to fully initialize
+  }
+
+  /// construct a partially loaded CachedExtent
+  /// must be identical with CachedExtent(ptr) after on_fully_loaded()
+  explicit CachedExtent(extent_len_t _length)
+    : length(_length),
+      loaded_length(0),
+      buffer_space(std::in_place) {
+    assert(is_aligned(length, CEPH_PAGE_SIZE));
+    assert(length > 0);
+    assert(!is_fully_loaded());
+    // must call init() to fully initialize
   }
 
   /// construct new CachedExtent, will deep copy the buffer
@@ -758,16 +923,20 @@ protected:
     : state(other.state),
       dirty_from_or_retired_at(other.dirty_from_or_retired_at),
       length(other.get_length()),
+      loaded_length(other.get_loaded_length()),
       version(other.version),
       poffset(other.poffset) {
-      assert((length % CEPH_PAGE_SIZE) == 0);
-      if (other.is_fully_loaded()) {
-        ptr.emplace(buffer::create_page_aligned(length));
-        other.ptr->copy_out(0, length, ptr->c_str());
-      } else {
-        // the extent must be fully loaded before CoW
-        assert(length == 0); // in case of root
-      }
+    // the extent must be fully loaded before CoW
+    assert(other.is_fully_loaded());
+    assert(is_aligned(length, CEPH_PAGE_SIZE));
+    if (length > 0) {
+      ptr = create_extent_ptr_rand(length);
+      other.ptr->copy_out(0, length, ptr->c_str());
+    } else { // length == 0, must be root
+      ptr = ceph::bufferptr(0);
+    }
+
+    assert(is_fully_loaded());
   }
 
   struct share_buffer_t {};
@@ -777,23 +946,35 @@ protected:
       dirty_from_or_retired_at(other.dirty_from_or_retired_at),
       ptr(other.ptr),
       length(other.get_length()),
+      loaded_length(other.get_loaded_length()),
       version(other.version),
-      poffset(other.poffset) {}
-
-  // 0 length is only possible for the RootBlock
-  struct zero_length_t {};
-  CachedExtent(zero_length_t) : ptr(ceph::bufferptr(0)), length(0) {};
-
-  struct retired_placeholder_t{};
-  CachedExtent(retired_placeholder_t, extent_len_t _length)
-    : state(extent_state_t::CLEAN),
-      length(_length) {
+      poffset(other.poffset) {
+    // the extent must be fully loaded before CoW
+    assert(other.is_fully_loaded());
+    assert(is_aligned(length, CEPH_PAGE_SIZE));
     assert(length > 0);
+    assert(is_fully_loaded());
   }
 
-  /// no buffer extent, for lazy read
-  CachedExtent(extent_len_t _length) : length(_length) {
-    assert(length > 0);
+  // 0 length is only possible for the RootBlock
+  struct root_construct_t {};
+  CachedExtent(root_construct_t)
+    : ptr(ceph::bufferptr(0)),
+      length(0),
+      loaded_length(0) {
+    assert(is_fully_loaded());
+    // must call init() to fully initialize
+  }
+
+  struct retired_placeholder_construct_t {};
+  CachedExtent(retired_placeholder_construct_t, extent_len_t _length)
+    : state(extent_state_t::CLEAN),
+      length(_length),
+      loaded_length(0),
+      buffer_space(std::in_place) {
+    assert(!is_fully_loaded());
+    assert(is_aligned(length, CEPH_PAGE_SIZE));
+    // must call init() to fully initialize
   }
 
   friend class Cache;
@@ -804,9 +985,8 @@ protected:
   }
 
   template <typename T>
-  static TCachedExtentRef<T> make_placeholder_cached_extent_ref(
-    extent_len_t length) {
-    return new T(length);
+  static TCachedExtentRef<T> make_cached_extent_ref() {
+    return new T();
   }
 
   void reset_prior_instance() {
@@ -869,6 +1049,45 @@ protected:
     }
   }
 
+  /// Returns the ranges to load, convert to fully loaded is possible
+  load_ranges_t load_ranges(extent_len_t offset, extent_len_t _length) {
+    assert(is_aligned(offset, CEPH_PAGE_SIZE));
+    assert(is_aligned(_length, CEPH_PAGE_SIZE));
+    assert(_length > 0);
+    assert(offset + _length <= length);
+    assert(!is_fully_loaded());
+
+    if (loaded_length == 0 && _length == length) {
+      assert(offset == 0);
+      // skip rebuilding the buffer from buffer_space
+      ptr = create_extent_ptr_rand(length);
+      loaded_length = _length;
+      buffer_space.reset();
+      assert(is_fully_loaded());
+      on_fully_loaded();
+      load_ranges_t ret;
+      ret.push_back(offset, *ptr);
+      return ret;
+    }
+
+    load_ranges_t ret = buffer_space->load_ranges(offset, _length);
+    loaded_length += ret.length;
+    assert(length >= loaded_length);
+    if (length == loaded_length) {
+      // convert to fully loaded
+      ptr = buffer_space->to_full_ptr(length);
+      buffer_space.reset();
+      assert(is_fully_loaded());
+      on_fully_loaded();
+      // adjust ret since the ptr has been rebuild
+      for (load_range_t& range : ret.ranges) {
+        auto range_length = range.ptr.length();
+        range.ptr = ceph::bufferptr(*ptr, range.offset, range_length);
+      }
+    }
+    return ret;
+  }
+
   friend class crimson::os::seastore::SegmentedAllocator;
   friend class crimson::os::seastore::TransactionManager;
   friend class crimson::os::seastore::ExtentPlacementManager;
@@ -878,12 +1097,12 @@ protected:
   friend class ::lba_btree_test;
   friend class ::btree_test_base;
   friend class ::cache_test_t;
+  template <typename, typename, typename>
+  friend class ParentNode;
 };
 
 std::ostream &operator<<(std::ostream &, CachedExtent::extent_state_t);
 std::ostream &operator<<(std::ostream &, const CachedExtent&);
-
-bool is_backref_mapped_extent_node(const CachedExtentRef &extent);
 
 /// Compare extents by paddr
 struct paddr_cmp {
@@ -956,7 +1175,7 @@ template <typename T, typename C, typename Cmp>
 class addr_extent_set_base_t
   : public std::set<C, Cmp> {};
 
-using pextent_set_t = addr_extent_set_base_t<
+using retired_extent_set_t = addr_extent_set_base_t<
   paddr_t,
   trans_retired_extent_link_t,
   ref_paddr_cmp
@@ -1041,6 +1260,14 @@ public:
     return extent_index.find(offset, paddr_cmp());
   }
 
+  bool exists(CachedExtent& extent) const {
+    auto iter = extent_index.find(extent.get_paddr(), paddr_cmp());
+    if (iter == extent_index.end()) {
+      return false;
+    }
+    return (&*iter == &extent);
+  }
+
   auto begin() {
     return extent_index.begin();
   }
@@ -1066,53 +1293,6 @@ private:
   uint64_t bytes = 0;
 };
 
-class ChildableCachedExtent;
-class LogicalCachedExtent;
-
-class child_pos_t {
-public:
-  child_pos_t(CachedExtentRef stable_parent, uint16_t pos)
-    : stable_parent(stable_parent), pos(pos) {}
-
-  template <typename parent_t>
-  TCachedExtentRef<parent_t> get_parent() {
-    ceph_assert(stable_parent);
-    return stable_parent->template cast<parent_t>();
-  }
-  uint16_t get_pos() {
-    return pos;
-  }
-  void link_child(ChildableCachedExtent *c);
-private:
-  CachedExtentRef stable_parent;
-  uint16_t pos = std::numeric_limits<uint16_t>::max();
-};
-
-using get_child_ertr = crimson::errorator<
-  crimson::ct_error::input_output_error>;
-template <typename T>
-struct get_child_ret_t {
-  std::variant<child_pos_t, get_child_ertr::future<TCachedExtentRef<T>>> ret;
-  get_child_ret_t(child_pos_t pos)
-    : ret(std::move(pos)) {}
-  get_child_ret_t(get_child_ertr::future<TCachedExtentRef<T>> child)
-    : ret(std::move(child)) {}
-
-  bool has_child() const {
-    return ret.index() == 1;
-  }
-
-  child_pos_t &get_child_pos() {
-    ceph_assert(ret.index() == 0);
-    return std::get<0>(ret);
-  }
-
-  get_child_ertr::future<TCachedExtentRef<T>> &get_child_fut() {
-    ceph_assert(ret.index() == 1);
-    return std::get<1>(ret);
-  }
-};
-
 template <typename key_t, typename>
 class PhysicalNodeMapping;
 
@@ -1122,47 +1302,17 @@ using PhysicalNodeMappingRef = std::unique_ptr<PhysicalNodeMapping<key_t, val_t>
 template <typename key_t, typename val_t>
 class PhysicalNodeMapping {
 public:
+  PhysicalNodeMapping() = default;
+  PhysicalNodeMapping(const PhysicalNodeMapping&) = delete;
   virtual extent_len_t get_length() const = 0;
-  virtual extent_types_t get_type() const = 0;
   virtual val_t get_val() const = 0;
   virtual key_t get_key() const = 0;
-  virtual PhysicalNodeMappingRef<key_t, val_t> duplicate() const = 0;
-  virtual PhysicalNodeMappingRef<key_t, val_t> refresh_with_pending_parent() {
-    ceph_abort("impossible");
-    return {};
-  }
   virtual bool has_been_invalidated() const = 0;
   virtual CachedExtentRef get_parent() const = 0;
   virtual uint16_t get_pos() const = 0;
-  // An lba pin may be indirect, see comments in lba_manager/btree/btree_lba_manager.h
-  virtual bool is_indirect() const { return false; }
-  virtual key_t get_intermediate_key() const { return min_max_t<key_t>::null; }
-  virtual key_t get_intermediate_base() const { return min_max_t<key_t>::null; }
-  virtual extent_len_t get_intermediate_length() const { return 0; }
   virtual uint32_t get_checksum() const {
     ceph_abort("impossible");
     return 0;
-  }
-  // The start offset of the pin, must be 0 if the pin is not indirect
-  virtual extent_len_t get_intermediate_offset() const {
-    return std::numeric_limits<extent_len_t>::max();
-  }
-
-  virtual get_child_ret_t<LogicalCachedExtent>
-  get_logical_extent(Transaction &t) = 0;
-
-  void link_child(ChildableCachedExtent *c) {
-    ceph_assert(child_pos);
-    child_pos->link_child(c);
-  }
-
-  // For reserved mappings, the return values are
-  // undefined although it won't crash
-  virtual bool is_stable() const = 0;
-  virtual bool is_data_stable() const = 0;
-  virtual bool is_clone() const = 0;
-  bool is_zero_reserved() const {
-    return !get_val().is_real();
   }
   virtual bool is_parent_viewable() const = 0;
   virtual bool is_parent_valid() const = 0;
@@ -1176,23 +1326,7 @@ public:
   }
 
   virtual ~PhysicalNodeMapping() {}
-protected:
-  std::optional<child_pos_t> child_pos = std::nullopt;
 };
-
-using LBAMapping = PhysicalNodeMapping<laddr_t, paddr_t>;
-using LBAMappingRef = PhysicalNodeMappingRef<laddr_t, paddr_t>;
-
-std::ostream &operator<<(std::ostream &out, const LBAMapping &rhs);
-
-using lba_pin_list_t = std::list<LBAMappingRef>;
-
-std::ostream &operator<<(std::ostream &out, const lba_pin_list_t &rhs);
-
-using BackrefMapping = PhysicalNodeMapping<paddr_t, laddr_t>;
-using BackrefMappingRef = PhysicalNodeMappingRef<paddr_t, laddr_t>;
-
-using backref_pin_list_t = std::list<BackrefMappingRef>;
 
 /**
  * RetiredExtentPlaceholder
@@ -1209,15 +1343,15 @@ class RetiredExtentPlaceholder : public CachedExtent {
 
 public:
   RetiredExtentPlaceholder(extent_len_t length)
-    : CachedExtent(CachedExtent::retired_placeholder_t{}, length) {}
+    : CachedExtent(CachedExtent::retired_placeholder_construct_t{}, length) {}
 
   CachedExtentRef duplicate_for_write(Transaction&) final {
-    ceph_assert(0 == "Should never happen for a placeholder");
+    ceph_abort("Should never happen for a placeholder");
     return CachedExtentRef();
   }
 
   ceph::bufferlist get_delta() final {
-    ceph_assert(0 == "Should never happen for a placeholder");
+    ceph_abort("Should never happen for a placeholder");
     return ceph::bufferlist();
   }
 
@@ -1228,11 +1362,7 @@ public:
 
   void apply_delta_and_adjust_crc(
     paddr_t base, const ceph::bufferlist &bl) final {
-    ceph_assert(0 == "Should never happen for a placeholder");
-  }
-
-  bool is_logical() const final {
-    return false;
+    ceph_abort("Should never happen for a placeholder");
   }
 
   void on_rewrite(Transaction &, CachedExtent&, extent_len_t) final {}
@@ -1242,71 +1372,11 @@ public:
   }
 
   void on_delta_write(paddr_t record_block_offset) final {
-    ceph_assert(0 == "Should never happen for a placeholder");
+    ceph_abort("Should never happen for a placeholder");
   }
 };
 
-class parent_tracker_t
-  : public boost::intrusive_ref_counter<
-     parent_tracker_t, boost::thread_unsafe_counter> {
-public:
-  parent_tracker_t(CachedExtentRef parent)
-    : parent(parent) {}
-  parent_tracker_t(CachedExtent* parent)
-    : parent(parent) {}
-  ~parent_tracker_t();
-  template <typename T = CachedExtent>
-  TCachedExtentRef<T> get_parent() const {
-    ceph_assert(parent);
-    if constexpr (std::is_same_v<T, CachedExtent>) {
-      return parent;
-    } else {
-      return parent->template cast<T>();
-    }
-  }
-  void reset_parent(CachedExtentRef p) {
-    parent = p;
-  }
-  bool is_valid() const {
-    return parent && parent->is_valid();
-  }
-private:
-  CachedExtentRef parent;
-};
-
-std::ostream &operator<<(std::ostream &, const parent_tracker_t &);
-
-using parent_tracker_ref = boost::intrusive_ptr<parent_tracker_t>;
-
-class ChildableCachedExtent : public CachedExtent {
-public:
-  template <typename... T>
-  ChildableCachedExtent(T&&... t) : CachedExtent(std::forward<T>(t)...) {}
-  bool has_parent_tracker() const {
-    return (bool)parent_tracker;
-  }
-  void reset_parent_tracker(parent_tracker_t *p = nullptr) {
-    parent_tracker.reset(p);
-  }
-  bool is_parent_valid() const {
-    return parent_tracker && parent_tracker->is_valid();
-  }
-  template <typename T = CachedExtent>
-  TCachedExtentRef<T> get_parent_node() const {
-    assert(parent_tracker);
-    return parent_tracker->template get_parent<T>();
-  }
-  void take_prior_parent_tracker() {
-    auto &prior = (ChildableCachedExtent&)(*get_prior_instance());
-    parent_tracker = prior.parent_tracker;
-  }
-  std::ostream &print_detail(std::ostream &out) const final;
-private:
-  parent_tracker_ref parent_tracker;
-  virtual std::ostream &_print_detail(std::ostream &out) const {
-    return out;
-  }
-};
+class LBAMapping;
 /**
  * LogicalCachedExtent
  *
@@ -1315,17 +1385,37 @@ private:
  * Users of TransactionManager should be using extents derived from
  * LogicalCachedExtent.
  */
-class LogicalCachedExtent : public ChildableCachedExtent {
+class LogicalCachedExtent : public CachedExtent {
 public:
-  template <typename... T>
-  LogicalCachedExtent(T&&... t)
-    : ChildableCachedExtent(std::forward<T>(t)...)
-  {}
+  using CachedExtent::CachedExtent;
 
-  void on_rewrite(Transaction&, CachedExtent &extent, extent_len_t off) final {
+  LogicalCachedExtent(const LogicalCachedExtent& other)
+    : CachedExtent(other),
+     seen_by_users(other.seen_by_users) {}
+
+  LogicalCachedExtent(const LogicalCachedExtent& other, share_buffer_t s)
+    : CachedExtent(other, s),
+     seen_by_users(other.seen_by_users) {}
+
+  void on_rewrite(Transaction &t, CachedExtent &extent, extent_len_t off) final {
     assert(get_type() == extent.get_type());
     auto &lextent = (LogicalCachedExtent&)extent;
     set_laddr((lextent.get_laddr() + off).checked_to_laddr());
+    seen_by_users = lextent.seen_by_users;
+    do_on_rewrite(t, lextent);
+  }
+
+  virtual void do_on_rewrite(Transaction &t, LogicalCachedExtent &extent) {}
+
+  bool is_seen_by_users() const {
+    return seen_by_users;
+  }
+
+  // handled under TransactionManager,
+  // user should not set this by themselves.
+  void set_seen_by_users() {
+    assert(!seen_by_users);
+    seen_by_users = true;
   }
 
   bool has_laddr() const {
@@ -1341,11 +1431,7 @@ public:
     laddr = nladdr;
   }
 
-  void maybe_set_intermediate_laddr(LBAMapping &mapping) {
-    laddr = mapping.is_indirect()
-      ? mapping.get_intermediate_base()
-      : mapping.get_key();
-  }
+  void maybe_set_intermediate_laddr(LBAMapping &mapping);
 
   void apply_delta_and_adjust_crc(
     paddr_t base, const ceph::bufferlist &bl) final {
@@ -1354,25 +1440,29 @@ public:
   }
 
   bool is_logical() const final {
+    assert(is_logical_type(get_type()));
+    assert(!is_physical_type(get_type()));
     return true;
   }
 
-  std::ostream &_print_detail(std::ostream &out) const final;
+  std::ostream &print_detail(std::ostream &out) const final;
 
   struct modified_region_t {
     extent_len_t offset;
     extent_len_t len;
   };
   virtual std::optional<modified_region_t> get_modified_region() {
+    ceph_abort("Unsupported");
     return std::nullopt;
   }
 
-  virtual void clear_modified_region() {}
+  virtual void clear_modified_region() {
+    ceph_abort("Unsupported");
+  }
 
-  virtual ~LogicalCachedExtent();
+  virtual ~LogicalCachedExtent() {}
 
 protected:
-  void on_replace_prior() final;
 
   virtual void apply_delta(const ceph::bufferlist &bl) = 0;
 
@@ -1392,6 +1482,12 @@ private:
   // the logical address of the extent, and if shared,
   // it is the intermediate_base, see BtreeLBAMapping comments.
   laddr_t laddr = L_ADDR_NULL;
+
+  // whether the extent has been seen by users since OSD startup,
+  // otherwise, an extent can still be alive if it's dirty or pinned by lru.
+  //
+  // user must initialize the logical extent upon the first access.
+  bool seen_by_users = false;
 };
 
 using LogicalCachedExtentRef = TCachedExtentRef<LogicalCachedExtent>;
@@ -1417,17 +1513,17 @@ read_set_item_t<T>::read_set_item_t(T *t, CachedExtentRef ref)
 {}
 
 template <typename T>
-inline bool read_set_item_t<T>::cmp_t::operator()(
+inline bool read_set_item_t<T>::extent_cmp_t::operator()(
   const read_set_item_t<T> &lhs, const read_set_item_t<T> &rhs) const {
   return lhs.ref->poffset < rhs.ref->poffset;
 }
 template <typename T>
-inline bool read_set_item_t<T>::cmp_t::operator()(
+inline bool read_set_item_t<T>::extent_cmp_t::operator()(
   const paddr_t &lhs, const read_set_item_t<T> &rhs) const {
   return lhs < rhs.ref->poffset;
 }
 template <typename T>
-inline bool read_set_item_t<T>::cmp_t::operator()(
+inline bool read_set_item_t<T>::extent_cmp_t::operator()(
   const read_set_item_t<T> &lhs, const paddr_t &rhs) const {
   return lhs.ref->poffset < rhs;
 }
@@ -1442,11 +1538,9 @@ template <typename T>
 using lextent_list_t = addr_extent_list_base_t<
   laddr_t, TCachedExtentRef<T>>;
 
-}
+} // namespace crimson::os::seastore
 
 #if FMT_VERSION >= 90000
-template <> struct fmt::formatter<crimson::os::seastore::lba_pin_list_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::CachedExtent> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::LogicalCachedExtent> : fmt::ostream_formatter {};
-template <> struct fmt::formatter<crimson::os::seastore::LBAMapping> : fmt::ostream_formatter {};
 #endif

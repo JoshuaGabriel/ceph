@@ -55,6 +55,8 @@ class RGWSI_Zone : public RGWServiceInstance
   std::map<rgw_zone_id, RGWZone> zone_by_id;
 
   std::unique_ptr<rgw_sync_policy_info> sync_policy;
+  rgw::sal::ConfigStore *cfgstore{nullptr};
+  const rgw::SiteConfig* site{nullptr};
 
   void init(RGWSI_SysObj *_sysobj_svc,
 	    librados::Rados* rados_,
@@ -75,9 +77,10 @@ class RGWSI_Zone : public RGWServiceInstance
                              RGWPeriod *pperiod,
                              RGWZoneGroup *pzonegroup,
                              bool *pfound,
+                             rgw::sal::ConfigStore* cfgstore,
                              optional_yield y);
 public:
-  RGWSI_Zone(CephContext *cct);
+  RGWSI_Zone(CephContext *cct, rgw::sal::ConfigStore* cfgstore, const rgw::SiteConfig* _site);
   ~RGWSI_Zone();
 
   const RGWZoneParams& get_zone_params() const;
@@ -96,7 +99,6 @@ public:
   uint32_t get_zone_short_id() const;
 
   const std::string& get_current_period_id() const;
-  bool has_zonegroup_api(const std::string& api) const;
 
   bool zone_is_writeable();
   bool zone_syncs_from(const RGWZone& target_zone, const RGWZone& source_zone) const;
@@ -146,7 +148,7 @@ public:
   bool need_to_log_data() const;
   bool need_to_log_metadata() const;
   bool can_reshard() const;
-  bool is_syncing_bucket_meta(const rgw_bucket& bucket);
+  bool is_syncing_bucket_meta() const;
 
   int list_zonegroups(const DoutPrefixProvider *dpp, std::list<std::string>& zonegroups);
   int list_regions(const DoutPrefixProvider *dpp, std::list<std::string>& regions);

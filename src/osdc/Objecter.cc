@@ -12,10 +12,12 @@
  *
  */
 
-#include <algorithm>
-#include <cerrno>
-
 #include "Objecter.h"
+#include "Striper.h"
+
+#include <algorithm>
+#include <sstream>
+
 #include "osd/OSDMap.h"
 #include "osd/error_code.h"
 #include "Filer.h"
@@ -58,6 +60,7 @@
 #include "common/async/waiter.h"
 #include "error_code.h"
 
+#include "neorados/RADOSImpl.h"
 
 using std::list;
 using std::make_pair;
@@ -90,6 +93,7 @@ using ceph::timespan;
 using ceph::shunique_lock;
 using ceph::acquire_shared;
 using ceph::acquire_unique;
+using namespace std::literals;
 
 namespace bc = boost::container;
 namespace bs = boost::system;
@@ -180,6 +184,10 @@ enum {
   l_osdc_osdop_omap_rd,
   l_osdc_osdop_omap_del,
 
+  l_osdc_replica_read_sent,
+  l_osdc_replica_read_bounced,
+  l_osdc_replica_read_completed,
+
   l_osdc_last,
 };
 
@@ -214,15 +222,13 @@ std::unique_lock<std::mutex> Objecter::OSDSession::get_lock(object_t& oid)
   return {completion_locks[h % num_locks], std::defer_lock};
 }
 
-const char** Objecter::get_tracked_conf_keys() const
+std::vector<std::string> Objecter::get_tracked_keys() const noexcept
 {
-  static const char *config_keys[] = {
-    "crush_location",
-    "rados_mon_op_timeout",
-    "rados_osd_op_timeout",
-    NULL
+  return {
+    "crush_location"s,
+    "rados_mon_op_timeout"s,
+    "rados_osd_op_timeout"s
   };
-  return config_keys;
 }
 
 
@@ -237,6 +243,13 @@ void Objecter::handle_conf_change(const ConfigProxy& conf,
   }
   if (changed.count("rados_osd_op_timeout")) {
     osd_timeout = conf.get_val<std::chrono::seconds>("rados_osd_op_timeout");
+  }
+
+  auto read_policy = conf.get_val<std::string>("rados_replica_read_policy");
+  if (read_policy == "localize") {
+    extra_read_flags = CEPH_OSD_FLAG_LOCALIZE_READS;
+  } else if (read_policy == "balance") {
+    extra_read_flags = CEPH_OSD_FLAG_BALANCE_READS;
   }
 }
 
@@ -377,6 +390,13 @@ void Objecter::init()
 			"OSD OMAP read operations");
     pcb.add_u64_counter(l_osdc_osdop_omap_del, "omap_del",
 			"OSD OMAP delete operations");
+
+    pcb.add_u64_counter(l_osdc_replica_read_sent, "replica_read_sent",
+			"Operations sent to replica");
+    pcb.add_u64_counter(l_osdc_replica_read_bounced, "replica_read_bounced",
+			"Operations bounced by replica to be resent to primary");
+    pcb.add_u64_counter(l_osdc_replica_read_completed, "replica_read_completed",
+			"Operations completed by replica");
 
     logger = pcb.create_perf_counters();
     cct->get_perfcounters_collection()->add(logger);
@@ -709,7 +729,7 @@ void Objecter::_send_linger_ping(LingerOp *info)
 
   Op *o = new Op(info->target.base_oid, info->target.base_oloc,
 		 std::move(opv), info->target.flags | CEPH_OSD_FLAG_READ,
-		 fu2::unique_function<Op::OpSig>{CB_Linger_Ping(this, info, now)},
+		 CB_Linger_Ping(this, info, now),
 		 nullptr, nullptr);
   o->target = info->target;
   o->should_resend = false;
@@ -737,7 +757,7 @@ void Objecter::_linger_ping(LingerOp *info, bs::error_code ec, ceph::coarse_mono
       ec = _normalize_watch_error(ec);
       info->last_error = ec;
       if (info->handle) {
-	asio::defer(finish_strand, CB_DoWatchError(this, info, ec));
+	asio::post(finish_strand, CB_DoWatchError(this, info, ec));
       }
     }
   } else {
@@ -981,52 +1001,61 @@ void Objecter::_do_watch_notify(boost::intrusive_ptr<LingerOp> info,
   info->finished_async();
 }
 
-bool Objecter::ms_dispatch(Message *m)
+Dispatcher::dispatch_result_t Objecter::ms_dispatch2(const MessageRef &m)
 {
   ldout(cct, 10) << __func__ << " " << cct << " " << *m << dendl;
   switch (m->get_type()) {
     // these we exlusively handle
   case CEPH_MSG_OSD_OPREPLY:
-    handle_osd_op_reply(static_cast<MOSDOpReply*>(m));
-    return true;
+    m->get(); /* ref to be consumed */
+    handle_osd_op_reply(ref_cast<MOSDOpReply>(m).get());
+    return Dispatcher::HANDLED();
 
   case CEPH_MSG_OSD_BACKOFF:
-    handle_osd_backoff(static_cast<MOSDBackoff*>(m));
-    return true;
+    m->get(); /* ref to be consumed */
+    handle_osd_backoff(ref_cast<MOSDBackoff>(m).get());
+    return Dispatcher::HANDLED();
 
   case CEPH_MSG_WATCH_NOTIFY:
-    handle_watch_notify(static_cast<MWatchNotify*>(m));
-    m->put();
-    return true;
+    /* ref not consumed! */
+    handle_watch_notify(ref_cast<MWatchNotify>(m).get());
+    return Dispatcher::HANDLED();
 
   case MSG_COMMAND_REPLY:
     if (m->get_source().type() == CEPH_ENTITY_TYPE_OSD) {
-      handle_command_reply(static_cast<MCommandReply*>(m));
-      return true;
+      m->get(); /* ref to be consumed */
+      handle_command_reply(ref_cast<MCommandReply>(m).get());
+      return Dispatcher::HANDLED();
     } else {
-      return false;
+      return Dispatcher::UNHANDLED();
     }
 
   case MSG_GETPOOLSTATSREPLY:
-    handle_get_pool_stats_reply(static_cast<MGetPoolStatsReply*>(m));
-    return true;
+    m->get(); /* ref to be consumed */
+    handle_get_pool_stats_reply(ref_cast<MGetPoolStatsReply>(m).get());
+    return Dispatcher::HANDLED();
 
   case CEPH_MSG_POOLOP_REPLY:
-    handle_pool_op_reply(static_cast<MPoolOpReply*>(m));
-    return true;
+    m->get(); /* ref to be consumed */
+    handle_pool_op_reply(ref_cast<MPoolOpReply>(m).get());
+    return Dispatcher::HANDLED();
 
   case CEPH_MSG_STATFS_REPLY:
-    handle_fs_stats_reply(static_cast<MStatfsReply*>(m));
-    return true;
+    m->get(); /* ref to be consumed */
+    handle_fs_stats_reply(ref_cast<MStatfsReply>(m).get());
+    return Dispatcher::HANDLED();
 
     // these we give others a chance to inspect
 
     // MDS, OSD
   case CEPH_MSG_OSD_MAP:
-    handle_osd_map(static_cast<MOSDMap*>(m));
-    return false;
+    /* ref not consumed! */
+    handle_osd_map(ref_cast<MOSDMap>(m).get());
+    return Dispatcher::ACKNOWLEDGED();
+
+  default:
+    return Dispatcher::UNHANDLED();
   }
-  return false;
 }
 
 void Objecter::_scan_requests(
@@ -1382,7 +1411,7 @@ void Objecter::handle_osd_map(MOSDMap *m)
     for (auto& [c, ec] : p->second) {
       asio::post(service.get_executor(), asio::append(std::move(c), ec));
     }
-    waiting_for_map.erase(p++);
+    p = waiting_for_map.erase(p);
   }
 
   monc->sub_got("osdmap", osdmap->get_epoch());
@@ -2328,6 +2357,10 @@ void Objecter::_send_op_account(Op *op)
     ldout(cct, 20) << " note: not requesting reply" << dendl;
   }
 
+  if (op->target.used_replica) {
+    logger->inc(l_osdc_replica_read_sent);
+  }
+
   logger->inc(l_osdc_op_active);
   logger->inc(l_osdc_op);
   logger->inc(l_osdc_oplen_avg, op->ops.size());
@@ -2387,6 +2420,23 @@ void Objecter::_send_op_account(Op *op)
       logger->inc(code);
   }
 }
+
+struct op_cancellation {
+  ceph_tid_t tid;
+  Objecter* objecter;
+
+  op_cancellation(ceph_tid_t tid, Objecter* objecter)
+    : tid(tid), objecter(objecter) {}
+
+  void operator ()(asio::cancellation_type_t type) {
+    if (type == asio::cancellation_type::total ||
+	type == asio::cancellation_type::terminal) {
+      // Since nobody can cancel until we return (I hope) we shouldn't
+      // need a mutex or anything.
+      objecter->op_cancel(tid, asio::error::operation_aborted);
+    }
+  }
+};
 
 void Objecter::_op_submit(Op *op, shunique_lock<ceph::shared_mutex>& sul, ceph_tid_t *ptid)
 {
@@ -2470,6 +2520,16 @@ void Objecter::_op_submit(Op *op, shunique_lock<ceph::shared_mutex>& sul, ceph_t
 		 << dendl;
 
   _session_op_assign(s, op);
+
+
+  auto compptr = std::get_if<Op::OpComp>(&op->onfinish);
+  if (compptr) {
+    // arrange for per-op cancellation
+    auto slot = boost::asio::get_associated_cancellation_slot(*compptr);
+    if (slot.is_connected()) {
+      slot.template emplace<op_cancellation>(op->tid, this);
+    }
+  }
 
   if (need_send) {
     _send_op(op);
@@ -2902,6 +2962,8 @@ int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change)
 	pi->peering_crush_bucket_barrier,
 	t->peering_crush_mandatory_member,
 	pi->peering_crush_mandatory_member,
+	t->allows_ecoptimizations,
+	pi->allows_ecoptimizations(),
 	prev_pgid)) {
     force_resend = true;
   }
@@ -2957,6 +3019,7 @@ int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change)
     t->peering_crush_bucket_target = pi->peering_crush_bucket_target;
     t->peering_crush_bucket_barrier = pi->peering_crush_bucket_barrier;
     t->peering_crush_mandatory_member = pi->peering_crush_mandatory_member;
+    t->allows_ecoptimizations = pi->allows_ecoptimizations();
     ldout(cct, 10) << __func__ << " "
 		   << " raw pgid " << pgid << " -> actual " << t->actual_pgid
 		   << " acting " << t->acting
@@ -3475,6 +3538,15 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     _op_submit(op, sul, NULL);
     m->put();
     return;
+  }
+
+  if (op->target.flags & (CEPH_OSD_FLAG_BALANCE_READS |
+			  CEPH_OSD_FLAG_LOCALIZE_READS)) {
+    if (rc == -EAGAIN) {
+      logger->inc(l_osdc_replica_read_bounced);
+    } else {
+      logger->inc(l_osdc_replica_read_completed);
+    }
   }
 
   if (rc == -EAGAIN) {
@@ -5087,6 +5159,15 @@ Objecter::Objecter(CephContext *cct,
 {
   mon_timeout = cct->_conf.get_val<std::chrono::seconds>("rados_mon_op_timeout");
   osd_timeout = cct->_conf.get_val<std::chrono::seconds>("rados_osd_op_timeout");
+
+  auto read_policy = cct->_conf.get_val<std::string>("rados_replica_read_policy");
+  if (read_policy == "localize") {
+    ldout(cct, 20) << __func__ << ": read policy: localize" << dendl;
+    extra_read_flags = CEPH_OSD_FLAG_LOCALIZE_READS;
+  } else if (read_policy == "balance") {
+    ldout(cct, 20) << __func__ << ": read policy: balance" << dendl;
+    extra_read_flags = CEPH_OSD_FLAG_BALANCE_READS;
+  }
 }
 
 Objecter::~Objecter()

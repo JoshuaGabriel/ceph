@@ -28,49 +28,38 @@ const get_phy_tree_root_node_ret get_phy_tree_root_node<
     ceph_assert(backref_root->is_initial_pending()
       == root_block->is_pending());
     return {true,
-	    trans_intr::make_interruptible(
-	      c.cache.get_extent_viewable_by_trans(c.trans, backref_root))};
+            c.cache.get_extent_viewable_by_trans(c.trans, backref_root)};
   } else if (root_block->is_pending()) {
     auto &prior = static_cast<RootBlock&>(*root_block->get_prior_instance());
     backref_root = prior.backref_root_node;
     if (backref_root) {
       return {true,
-	      trans_intr::make_interruptible(
-		c.cache.get_extent_viewable_by_trans(c.trans, backref_root))};
+              c.cache.get_extent_viewable_by_trans(c.trans, backref_root)};
     } else {
-      c.cache.account_absent_access(c.trans.get_src());
       return {false,
-	      trans_intr::make_interruptible(
-		Cache::get_extent_ertr::make_ready_future<
-		  CachedExtentRef>())};
+              Cache::get_extent_iertr::make_ready_future<CachedExtentRef>()};
     }
   } else {
-    c.cache.account_absent_access(c.trans.get_src());
     return {false,
-	    trans_intr::make_interruptible(
-	      Cache::get_extent_ertr::make_ready_future<
-		CachedExtentRef>())};
+            Cache::get_extent_iertr::make_ready_future<CachedExtentRef>()};
   }
 }
 
-template <typename ROOT>
-void link_phy_tree_root_node(RootBlockRef &root_block, ROOT* backref_root) {
-  root_block->backref_root_node = backref_root;
-  ceph_assert(backref_root != nullptr);
-  backref_root->root_block = root_block;
-}
+template <typename RootT>
+class TreeRootLinker<RootBlock, RootT> {
+public:
+  static void link_root(RootBlockRef &root_block, RootT* backref_root) {
+    root_block->backref_root_node = backref_root;
+    ceph_assert(backref_root != nullptr);
+    backref_root->parent_of_root = root_block;
+  }
+  static void unlink_root(RootBlockRef &root_block) {
+    root_block->backref_root_node = nullptr;
+  }
+};
 
-template void link_phy_tree_root_node(
-  RootBlockRef &root_block, backref::BackrefInternalNode* backref_root);
-template void link_phy_tree_root_node(
-  RootBlockRef &root_block, backref::BackrefLeafNode* backref_root);
-template void link_phy_tree_root_node(
-  RootBlockRef &root_block, backref::BackrefNode* backref_root);
-
-template <>
-void unlink_phy_tree_root_node<paddr_t>(RootBlockRef &root_block) {
-  root_block->backref_root_node = nullptr;
-}
+template class TreeRootLinker<RootBlock, backref::BackrefInternalNode>;
+template class TreeRootLinker<RootBlock, backref::BackrefLeafNode>;
 
 }
 
@@ -170,7 +159,7 @@ BtreeBackrefManager::new_mapping(
 {
   ceph_assert(
     is_aligned(
-      key.get_addr_type() == paddr_types_t::SEGMENT ?
+      key.is_absolute_segmented() ?
 	key.as_seg_paddr().get_segment_off() :
 	key.as_blk_paddr().get_device_off(),
       cache.get_block_size()));
@@ -237,8 +226,7 @@ BtreeBackrefManager::new_mapping(
 	    c,
 	    *state.insert_iter,
 	    state.last_end,
-	    val,
-	    nullptr
+	    val
 	  ).si_then([&state, c, addr, len, key](auto &&p) {
 	    LOG_PREFIX(BtreeBackrefManager::new_mapping);
 	    auto [iter, inserted] = std::move(p);

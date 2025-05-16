@@ -48,6 +48,18 @@ add_executable(unittest_rocksdb_option
 add_ceph_unittest(unittest_rocksdb_option)
 target_link_libraries(unittest_rocksdb_option global os ${BLKID_LIBRARIES})
 
+# ceph_test_bluefs (a clone of unittest_bluefs)
+add_executable(ceph_test_bluefs
+  test_bluefs.cc
+  )
+target_link_libraries(ceph_test_bluefs
+  os
+  global
+  ${UNITTEST_LIBS}
+  )
+install(TARGETS ceph_test_bluefs
+  DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 if(WITH_EVENTTRACE)
   add_dependencies(os eventtrace_tp)
 endif()
@@ -98,6 +110,13 @@ if(WITH_BLUESTORE)
   add_ceph_unittest(unittest_bluefs)
   target_link_libraries(unittest_bluefs os global)
 
+  # unittest_bluefs_ex
+  add_executable(unittest_bluefs_ex
+    test_bluefs_ex.cc
+    )
+  add_ceph_unittest(unittest_bluefs_ex)
+  target_link_libraries(unittest_bluefs_ex os global)
+
   # unittest_bluestore_types
   add_executable(unittest_bluestore_types
     test_bluestore_types.cc
@@ -112,12 +131,11 @@ if(WITH_BLUESTORE)
   add_ceph_unittest(unittest_bdev)
   target_link_libraries(unittest_bdev os global)
 
-  # unittest_deferred
-  add_executable(unittest_deferred
+  # test_corrupt_deferred
+  add_executable(test_corrupt_deferred
     test_deferred.cc
     )
-  add_ceph_unittest(unittest_deferred)
-  target_link_libraries(unittest_deferred os global)
+  target_link_libraries(test_corrupt_deferred os global)
 
 endif(WITH_BLUESTORE)
 

@@ -12,19 +12,29 @@
  * 
  */
 
-
+#include "Locker.h"
+#include "MDCache.h"
 #include "CDir.h"
 #include "CDentry.h"
 #include "CInode.h"
 #include "common/config.h"
+#include "common/debug.h"
 #include "events/EOpen.h"
 #include "events/EUpdate.h"
-#include "Locker.h"
 #include "MDBalancer.h"
 #include "MDCache.h"
 #include "MDLog.h"
 #include "MDSRank.h"
 #include "MDSMap.h"
+#include "RetryMessage.h"
+#include "RetryRequest.h"
+#include "SimpleLock.h"
+#include "SnapRealm.h"
+#include "messages/MClientCaps.h"
+#include "messages/MClientCapRelease.h"
+#include "messages/MClientLease.h"
+#include "messages/MClientReply.h"
+#include "messages/MLock.h"
 #include "messages/MInodeFileCaps.h"
 #include "messages/MMDSPeerRequest.h"
 #include "Migrator.h"
@@ -415,7 +425,7 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
       if (mdr->lock_cache) { // debug
 	ceph_assert(mdr->lock_cache->opcode == CEPH_MDS_OP_UNLINK);
 	CDentry *dn = mdr->dn[0].back();
-	ceph_assert(dn->get_projected_linkage()->is_remote());
+	ceph_assert(dn->get_projected_linkage()->is_remote() || dn->get_projected_linkage()->is_referent_remote());
       }
 
       if (object->is_ambiguous_auth()) {
@@ -441,7 +451,7 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
 	} else if (CDentry *dn = dynamic_cast<CDentry*>(object)) {
 	  dir = dn->get_dir();
 	} else {
-	  ceph_assert(0 == "unknown type of lock parent");
+	  ceph_abort_msg("unknown type of lock parent");
 	}
 	if (dir->get_inode() == mdr->lock_cache->get_dir_inode()) {
 	  // forcibly auth pin if there is lock cache on parent dir
@@ -451,7 +461,7 @@ bool Locker::acquire_locks(const MDRequestRef& mdr,
 	{ // debug
 	  ceph_assert(mdr->lock_cache->opcode == CEPH_MDS_OP_UNLINK);
 	  CDentry *dn = mdr->dn[0].back();
-	  ceph_assert(dn->get_projected_linkage()->is_remote());
+	  ceph_assert(dn->get_projected_linkage()->is_remote() || dn->get_projected_linkage()->is_referent_remote());
 	}
       }
 
@@ -2599,6 +2609,7 @@ int Locker::issue_caps(CInode *in, Capability *only_cap)
 					   in->find_snaprealm()->inode->ino(),
 					   cap->get_cap_id(), cap->get_last_seq(),
 					   pending, wanted, 0, cap->get_mseq(),
+                                           cap->get_last_issue(),
 					   mds->get_osd_epoch_barrier());
 	in->encode_cap_message(m, cap);
 
@@ -2649,6 +2660,7 @@ int Locker::issue_caps(CInode *in, Capability *only_cap)
 					 in->find_snaprealm()->inode->ino(),
 					 cap->get_cap_id(), cap->get_last_seq(),
 					 after, wanted, 0, cap->get_mseq(),
+                                         cap->get_last_issue(),
 					 mds->get_osd_epoch_barrier());
       in->encode_cap_message(m, cap);
 
@@ -2675,6 +2687,7 @@ void Locker::issue_truncate(CInode *in)
                                        cap->get_cap_id(), cap->get_last_seq(),
                                        cap->pending(), cap->wanted(), 0,
                                        cap->get_mseq(),
+                                       cap->get_last_issue(),
                                        mds->get_osd_epoch_barrier());
     in->encode_cap_message(m, cap);			     
     mds->send_message_client_counted(m, cap->get_session());
@@ -3165,6 +3178,7 @@ void Locker::share_inode_max_size(CInode *in, Capability *only_cap)
                                          cap->pending(),
                                          cap->wanted(), 0,
                                          cap->get_mseq(),
+                                         cap->get_last_issue(),
                                          mds->get_osd_epoch_barrier());
       in->encode_cap_message(m, cap);
       mds->send_message_client_counted(m, cap->get_session());
@@ -3375,10 +3389,10 @@ void Locker::handle_client_caps(const cref_t<MClientCaps> &m)
     ref_t<MClientCaps> ack;
     if (op == CEPH_CAP_OP_FLUSHSNAP) {
       if (mds->logger) mds->logger->inc(l_mdss_ceph_cap_op_flushsnap_ack);
-      ack = make_message<MClientCaps>(CEPH_CAP_OP_FLUSHSNAP_ACK, m->get_ino(), 0, 0, 0, 0, 0, dirty, 0, mds->get_osd_epoch_barrier());
+      ack = make_message<MClientCaps>(CEPH_CAP_OP_FLUSHSNAP_ACK, m->get_ino(), 0, 0, 0, 0, 0, dirty, 0, 0, mds->get_osd_epoch_barrier());
     } else {
       if (mds->logger) mds->logger->inc(l_mdss_ceph_cap_op_flush_ack);
-      ack = make_message<MClientCaps>(CEPH_CAP_OP_FLUSH_ACK, m->get_ino(), 0, m->get_cap_id(), m->get_seq(), m->get_caps(), 0, dirty, 0, mds->get_osd_epoch_barrier());
+      ack = make_message<MClientCaps>(CEPH_CAP_OP_FLUSH_ACK, m->get_ino(), 0, m->get_cap_id(), m->get_seq(), m->get_caps(), 0, dirty, 0, 0, mds->get_osd_epoch_barrier());
     }
     ack->set_snap_follows(follows);
     ack->set_client_tid(m->get_client_tid());
@@ -3500,7 +3514,7 @@ void Locker::handle_client_caps(const cref_t<MClientCaps> &m)
     // case we get a dup response, so whatever.)
     ref_t<MClientCaps> ack;
     if (dirty) {
-      ack = make_message<MClientCaps>(CEPH_CAP_OP_FLUSHSNAP_ACK, in->ino(), 0, 0, 0, 0, 0, dirty, 0, mds->get_osd_epoch_barrier());
+      ack = make_message<MClientCaps>(CEPH_CAP_OP_FLUSHSNAP_ACK, in->ino(), 0, 0, 0, 0, 0, dirty, 0, 0, mds->get_osd_epoch_barrier());
       ack->set_snap_follows(follows);
       ack->set_client_tid(m->get_client_tid());
       ack->set_oldest_flush_tid(m->get_oldest_flush_tid());
@@ -3589,7 +3603,7 @@ void Locker::handle_client_caps(const cref_t<MClientCaps> &m)
       dout(7) << " flush client." << client << " dirty " << ccap_string(dirty)
 	      << " seq " << m->get_seq() << " on " << *in << dendl;
       ack = make_message<MClientCaps>(CEPH_CAP_OP_FLUSH_ACK, in->ino(), 0, cap->get_cap_id(), m->get_seq(),
-          m->get_caps(), 0, dirty, 0, mds->get_osd_epoch_barrier());
+          m->get_caps(), 0, dirty, 0, cap->get_last_issue(), mds->get_osd_epoch_barrier());
       ack->set_client_tid(m->get_client_tid());
       ack->set_oldest_flush_tid(m->get_oldest_flush_tid());
     }
@@ -4222,7 +4236,7 @@ void Locker::handle_client_cap_release(const cref_t<MClientCapRelease> &m)
   Session *session = mds->get_session(m);
 
   for (const auto &cap : m->caps) {
-    _do_cap_release(client, inodeno_t((uint64_t)cap.ino) , cap.cap_id, cap.migrate_seq, cap.seq);
+    _do_cap_release(client, inodeno_t((uint64_t)cap.ino) , cap.cap_id, cap.migrate_seq, cap.issue_seq);
   }
 
   if (session) {
@@ -4499,7 +4513,7 @@ void Locker::issue_client_lease(CDentry *dn, CInode *in, const MDRequestRef& mdr
       ceph_assert(dnl->get_inode() == in);
       mask = CEPH_LEASE_PRIMARY_LINK;
     } else {
-      if (dnl->is_remote())
+      if (dnl->is_remote() || dnl->is_referent_remote())
         ceph_assert(dnl->get_remote_ino() == in->ino());
       else
         ceph_assert(!in);
@@ -4552,6 +4566,7 @@ void Locker::encode_lease(bufferlist& bl, const session_info_t& info,
 			  const LeaseStat& ls)
 {
   if (info.has_feature(CEPHFS_FEATURE_REPLY_ENCODING)) {
+    dout(25) << "encode lease reply encoding: " << ls << dendl;
     ENCODE_START(2, 1, bl);
     encode(ls.mask, bl);
     encode(ls.duration_ms, bl);
@@ -4560,6 +4575,7 @@ void Locker::encode_lease(bufferlist& bl, const session_info_t& info,
     ENCODE_FINISH(bl);
   }
   else {
+    dout(25) << "encode lease NO reply encoding: " << ls << dendl;
     encode(ls.mask, bl);
     encode(ls.duration_ms, bl);
     encode(ls.seq, bl);

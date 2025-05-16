@@ -16,7 +16,13 @@ from subprocess import SubprocessError
 from urllib.parse import urlparse
 
 import requests
-from mgr_util import build_url, name_to_config_section
+
+try:
+    import xmltodict
+except ModuleNotFoundError:
+    logging.error("Module 'xmltodict' is not installed.")
+
+from mgr_util import build_url
 
 from .. import mgr
 from ..awsauth import S3Auth
@@ -94,9 +100,12 @@ def _determine_rgw_addr(daemon_info: Dict[str, Any]) -> RgwDaemon:
     Parse RGW daemon info to determine the configured host (IP address) and port.
     """
     daemon = RgwDaemon()
-    rgw_dns_name = CephService.send_command('mon', 'config get',
-                                            who=name_to_config_section('rgw.' + daemon_info['metadata']['id']),  # noqa E501 #pylint: disable=line-too-long
-                                            key='rgw_dns_name').rstrip()
+    rgw_dns_name = ''
+    if (
+        Settings.RGW_HOSTNAME_PER_DAEMON
+        and daemon_info['metadata']['id'] in Settings.RGW_HOSTNAME_PER_DAEMON
+    ):
+        rgw_dns_name = Settings.RGW_HOSTNAME_PER_DAEMON[daemon_info['metadata']['id']]
 
     daemon.port, daemon.ssl = _parse_frontend_config(daemon_info['metadata']['frontend_config#0'])
 
@@ -273,7 +282,9 @@ class RgwClient(RestClient):
         return (Settings.RGW_API_ACCESS_KEY,
                 Settings.RGW_API_SECRET_KEY,
                 Settings.RGW_API_ADMIN_RESOURCE,
-                Settings.RGW_API_SSL_VERIFY)
+                Settings.RGW_API_SSL_VERIFY,
+                Settings.RGW_HOSTNAME_PER_DAEMON
+                )
 
     @staticmethod
     def instance(userid: Optional[str] = None,
@@ -715,23 +726,39 @@ class RgwClient(RestClient):
     @RestClient.api_get('/{bucket_name}?lifecycle')
     def get_lifecycle(self, bucket_name, request=None):
         # pylint: disable=unused-argument
+
+        # xmltodict parser will prepend namespace to json keys as {ns0:key}
+        def remove_namespace(xml: str):
+            """Remove namespace in given xml string."""
+            root = ET.fromstring(xml)
+            for elem in root.iter():
+                tag_elements = elem.tag.split("}")  # tag: {ns}tagname
+                # Removing namespaces and attributes
+                elem.tag = tag_elements[1]
+                elem.attrib.clear()
+
+            return ET.tostring(root)
+
         try:
-            decoded_request = request(raw_content=True).decode("utf-8")  # type: ignore
-            result = {
-                'LifecycleConfiguration':
-                json.loads(
-                    decoded_request,
-                    object_pairs_hook=RgwClient._handle_rules
-                )
-            }
+            result = request(
+                raw_content=True, headers={'Accept': 'text/xml'}).decode()  # type: ignore
+            lifecycle = xmltodict.parse(remove_namespace(result), process_namespaces=False)
+            if lifecycle is not None:
+                lifecycle_config = lifecycle.get('LifecycleConfiguration', {})
+                rule = lifecycle_config.get('Rule')
+
+                if isinstance(rule, dict):
+                    lifecycle_config['Rule'] = [rule]
+
+                lifecycle['LifecycleConfiguration'] = lifecycle_config
+            return lifecycle
         except RequestException as e:
             if e.content:
-                content = json_str_to_object(e.content)
-                if content.get(
-                        'Code') == 'NoSuchLifecycleConfiguration':
+                root = ET.fromstring(e.content)
+                code = root.find('Code')
+                if code is not None and code.text == 'NoSuchLifecycleConfiguration':
                     return None
             raise DashboardException(msg=str(e), component='rgw')
-        return result
 
     @staticmethod
     def dict_to_xml(data):
@@ -948,6 +975,14 @@ class RgwClient(RestClient):
                    f' For more information about the format look at {link}')
             raise DashboardException(msg=msg, component='rgw')
 
+    def get_lifecycle_progress(self):
+        rgw_bucket_lc_progress_command = ['lc', 'list']
+        code, lifecycle_progress, _err = mgr.send_rgwadmin_command(rgw_bucket_lc_progress_command)
+        if code != 0:
+            raise DashboardException(msg=f'Error getting lifecycle status: {_err}',
+                                     component='rgw')
+        return lifecycle_progress
+
     def get_role(self, role_name: str):
         rgw_get_role_command = ['role', 'get', '--role-name', role_name]
         code, role, _err = mgr.send_rgwadmin_command(rgw_get_role_command)
@@ -1083,6 +1118,59 @@ class RgwClient(RestClient):
                 if content.get('Code') == 'ReplicationConfigurationNotFoundError':
                     return None
             raise e
+
+    @RestClient.api_post('?Action=CreateTopic&Name={name}')
+    def create_topic(self, request=None, name: str = '',
+                     push_endpoint: Optional[str] = '', opaque_data: Optional[str] = '',
+                     persistent: Optional[bool] = False, time_to_live: Optional[str] = '',
+                     max_retries: Optional[str] = '', retry_sleep_duration: Optional[str] = '',
+                     policy: Optional[str] = '',
+                     verify_ssl: Optional[bool] = False, cloud_events: Optional[bool] = False,
+                     ca_location: Optional[str] = None, amqp_exchange: Optional[str] = None,
+                     amqp_ack_level: Optional[str] = None,
+                     use_ssl: Optional[bool] = False, kafka_ack_level: Optional[str] = None,
+                     kafka_brokers: Optional[str] = None, mechanism: Optional[str] = None,
+                     ):
+        params = {'Name': name}
+
+        if push_endpoint:
+            params['push-endpoint'] = push_endpoint
+        if opaque_data:
+            params['OpaqueData'] = opaque_data
+        if persistent:
+            params['persistent'] = 'true' if persistent else 'false'
+        if time_to_live:
+            params['time_to_live'] = time_to_live
+        if max_retries:
+            params['max_retries'] = max_retries
+        if retry_sleep_duration:
+            params['retry_sleep_duration'] = retry_sleep_duration
+        if policy:
+            params['Policy'] = policy
+        if verify_ssl:
+            params['verify_ssl'] = 'true' if verify_ssl else 'false'
+        if cloud_events:
+            params['cloud_events'] = 'true' if cloud_events else 'false'
+        if ca_location:
+            params['ca_location'] = ca_location
+        if amqp_exchange:
+            params['amqp_exchange'] = amqp_exchange
+        if amqp_ack_level:
+            params['amqp_ack_level'] = amqp_ack_level
+        if use_ssl:
+            params['use_ssl'] = 'true' if use_ssl else 'false'
+        if kafka_ack_level:
+            params['kafka_ack_level'] = kafka_ack_level
+        if kafka_brokers:
+            params['kafka_brokers'] = kafka_brokers
+        if mechanism:
+            params['mechanism'] = mechanism
+        try:
+            result = request(params=params)
+        except RequestException as e:
+            raise DashboardException(msg=str(e), component='rgw')
+
+        return result
 
 
 class SyncStatus(Enum):
@@ -1290,9 +1378,19 @@ class RgwMultisiteAutomation:
                                                                    path=f'ui-api/rgw/multisite/check-daemons-status?service_name={service_name}',  # noqa E501  # pylint: disable=line-too-long
                                                                    token=cluster_token)
                     logger.info("Daemons status: %s", daemons_status)
+                    realms_list = multi_cluster_instance._proxy(
+                        method='GET',
+                        base_url=cluster_url,
+                        path='api/rgw/realm',
+                        token=cluster_token
+                    )
+                    logger.debug("Realms info in the selected cluster: %s", realms_list)
+                    system_user_param = "realmName" if realms_list.get('default_info') \
+                        else "zoneName"
                     if daemons_status is True:
                         self.check_user_in_second_cluster(cluster_url, cluster_token,
-                                                          username, replication_zone_name)
+                                                          username, replication_zone_name,
+                                                          system_user_param, realm_name)
                     else:
                         self.update_progress("Failed to set credentials in selected cluster", 'fail', "RGW daemons failed to start")  # noqa E501  # pylint: disable=line-too-long
                         return token_import_response
@@ -1310,9 +1408,17 @@ class RgwMultisiteAutomation:
             raise
 
     def check_user_in_second_cluster(self, cluster_url, cluster_token, username,
-                                     replication_zone_name):
+                                     replication_zone_name, system_user_param,
+                                     realm_name):
         logger.info("Checking for user %s in the second cluster", username)
-        path = f'api/rgw/zone/get_user_list?zoneName={replication_zone_name}'
+        params = {
+            "zoneName": f"zoneName={replication_zone_name}",
+            "realmName": f"realmName={realm_name}",
+        }
+        if system_user_param in params:
+            path = f"api/rgw/zone/get_user_list?{params[system_user_param]}"
+        else:
+            raise ValueError(f"Invalid system_user_param: {system_user_param}")
         user_found = False
         start_time = time.time()
         while not user_found:
@@ -1327,6 +1433,7 @@ class RgwMultisiteAutomation:
                 # pylint: disable=protected-access
                 user_content = multi_cluster_instance._proxy(method='GET', base_url=cluster_url,
                                                              path=path, token=cluster_token)
+                logger.debug("user_content in selected cluster: %s", user_content)
                 if isinstance(user_content, list) and username in user_content:
                     user_found = True
                     logger.info("User %s found in the second cluster", username)
@@ -1346,10 +1453,69 @@ class RgwMultisiteAutomation:
             time.sleep(5)
 
 
+class RgwRateLimit:
+    def get_global_rateLimit(self):
+        rate_limit_cmd = ['global', 'ratelimit', 'get']
+        try:
+            exit_code, out, err = mgr.send_rgwadmin_command(rate_limit_cmd)
+            if exit_code > 0:
+                raise DashboardException(f'Unable to get rate limit: {err}',
+                                         http_status_code=500, component='rgw')
+            return out
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')
+
+    def get_rateLimit(self, scope: str, name: str):
+        rate_limit_cmd = ['ratelimit', 'get', '--ratelimit-scope', scope]
+        if scope == 'user':
+            rate_limit_cmd.extend(['--uid', name])
+        if scope == 'bucket':
+            rate_limit_cmd.extend(['--bucket', name])
+        try:
+            exit_code, out, err = mgr.send_rgwadmin_command(rate_limit_cmd)
+            if exit_code > 0:
+                raise DashboardException(f'Unable to get rate limit: {err}',
+                                         http_status_code=500, component='rgw')
+            return out
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')
+
+    def set_rateLimit(self, scope: str, enabled: bool, name: str,
+                      max_read_ops: int, max_write_ops: int,
+                      max_read_bytes: int, max_write_bytes: int):
+        enabled = str(enabled)
+        rgw_rate_limit_cmd = ['ratelimit', 'set', '--ratelimit-scope', scope,
+                              '--max-read-ops', str(max_read_ops), '--max-write-ops',
+                              str(max_write_ops), '--max-write-bytes', str(max_write_bytes),
+                              '--max-read-bytes', str(max_read_bytes)]
+
+        rgw_rate_limit_enable_cmd = ['ratelimit', 'enable' if enabled == 'True' else 'disable',
+                                     '--ratelimit-scope', scope]
+        if scope == 'user':
+            rgw_rate_limit_cmd.extend(['--uid', name])
+            rgw_rate_limit_enable_cmd.extend(['--uid', name])
+
+        if scope == 'bucket':
+            rgw_rate_limit_cmd.extend(['--bucket', name, ])
+            rgw_rate_limit_enable_cmd.extend(['--bucket', name])
+        try:
+            if enabled == 'True':
+                exit_code, _, err = mgr.send_rgwadmin_command(rgw_rate_limit_cmd)
+                if exit_code > 0:
+                    raise DashboardException(f'Unable to set rate limit: {err}',
+                                             http_status_code=500, component='rgw')
+            exit_code1, _, err = mgr.send_rgwadmin_command(rgw_rate_limit_enable_cmd)
+
+            if exit_code1 > 0:
+                raise DashboardException(f'Unable to enable rate limit: {err}',
+                                         http_status_code=500, component='rgw')
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')
+
+
 class RgwMultisite:
     def migrate_to_multisite(self, realm_name: str, zonegroup_name: str, zone_name: str,
-                             zonegroup_endpoints: str, zone_endpoints: str, access_key: str,
-                             secret_key: str):
+                             zonegroup_endpoints: str, zone_endpoints: str, username: str):
         rgw_realm_create_cmd = ['realm', 'create', '--rgw-realm', realm_name, '--default']
         try:
             exit_code, _, err = mgr.send_rgwadmin_command(rgw_realm_create_cmd, False)
@@ -1411,18 +1577,34 @@ class RgwMultisite:
                                          http_status_code=500, component='rgw')
         except SubprocessError as error:
             raise DashboardException(error, http_status_code=500, component='rgw')
-
-        if access_key and secret_key:
-            rgw_zone_modify_cmd = ['zone', 'modify', '--rgw-zone', zone_name,
-                                   '--access-key', access_key, '--secret', secret_key]
-            try:
-                exit_code, _, err = mgr.send_rgwadmin_command(rgw_zone_modify_cmd)
-                if exit_code > 0:
-                    raise DashboardException(e=err, msg='Unable to modify zone',
-                                             http_status_code=500, component='rgw')
-            except SubprocessError as error:
-                raise DashboardException(error, http_status_code=500, component='rgw')
         self.update_period()
+
+        try:
+            user_details = self.create_system_user(username, zone_name)
+            if user_details:
+                keys = user_details['keys'][0]
+                access_key = keys['access_key']
+                secret_key = keys['secret_key']
+                if access_key and secret_key:
+                    self.modify_zone(zone_name=zone_name,
+                                     zonegroup_name=zonegroup_name,
+                                     default='true', master='true',
+                                     endpoints=zone_endpoints,
+                                     access_key=keys['access_key'],
+                                     secret_key=keys['secret_key'])
+                else:
+                    raise DashboardException(msg='Access key or secret key is missing',
+                                             http_status_code=500, component='rgw')
+        except Exception as e:
+            raise DashboardException(msg='Failed to modify zone or create system user: %s' % e,
+                                     http_status_code=500, component='rgw')
+
+        try:
+            rgw_service_manager = RgwServiceManager()
+            rgw_service_manager.restart_rgw_daemons_and_set_credentials()
+        except Exception as e:
+            raise DashboardException(msg='Failed to restart RGW daemon: %s' % e,
+                                     http_status_code=500, component='rgw')
 
     def create_realm(self, realm_name: str, default: bool):
         rgw_realm_create_cmd = ['realm', 'create']
@@ -1660,71 +1842,201 @@ class RgwMultisite:
             raise DashboardException(error, http_status_code=500, component='rgw')
         return out
 
+    def get_placement_by_placement_id(self, placement_id: str):
+        radosgw_get_placement_cmd = ['zonegroup', 'placement',
+                                     'get', '--placement-id', placement_id]
+        try:
+            exit_code, out, err = mgr.send_rgwadmin_command(radosgw_get_placement_cmd)
+            if exit_code > 0:
+                raise DashboardException(e=err, msg='Unable to get placement details by id',
+                                         http_status_code=500, component='rgw')
+
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')
+        return out
+
+    # If realm list is empty, restart RGW daemons. Otherwise, update the period.
+    def ensure_realm_and_sync_period(self):
+        rgw_realm_list = self.list_realms()
+        if len(rgw_realm_list['realms']) < 1:
+            rgw_service_manager = RgwServiceManager()
+            rgw_service_manager.restart_rgw_daemons()
+        else:
+            self.update_period()
+
+    def modify_retain_head(self, tier_config: dict) -> List[str]:
+        tier_config_items = []
+        for key, value in tier_config.items():
+            if isinstance(value, bool):
+                value = str(value).lower()
+            tier_config_items.append(f'{key}={value}')
+        return tier_config_items
+
     def add_placement_targets(self, zonegroup_name: str, placement_targets: List[Dict]):
         rgw_add_placement_cmd = ['zonegroup', 'placement', 'add']
-        for placement_target in placement_targets:
-            cmd_add_placement_options = ['--rgw-zonegroup', zonegroup_name,
-                                         '--placement-id', placement_target['placement_id']]
-            if placement_target['tags']:
-                cmd_add_placement_options += ['--tags', placement_target['tags']]
-            rgw_add_placement_cmd += cmd_add_placement_options
-            try:
-                exit_code, _, err = mgr.send_rgwadmin_command(rgw_add_placement_cmd)
-                if exit_code > 0:
-                    raise DashboardException(e=err,
-                                             msg='Unable to add placement target {} to zonegroup {}'.format(placement_target['placement_id'], zonegroup_name),  # noqa E501  #pylint: disable=line-too-long
-                                             http_status_code=500, component='rgw')
-            except SubprocessError as error:
-                raise DashboardException(error, http_status_code=500, component='rgw')
-            self.update_period()
-            storage_classes = placement_target['storage_class'].split(",") if placement_target['storage_class'] else []  # noqa E501  #pylint: disable=line-too-long
-            if storage_classes:
-                for sc in storage_classes:
-                    cmd_add_placement_options = ['--storage-class', sc]
-                    try:
-                        exit_code, _, err = mgr.send_rgwadmin_command(
-                            rgw_add_placement_cmd + cmd_add_placement_options)
-                        if exit_code > 0:
-                            raise DashboardException(e=err,
-                                                     msg='Unable to add placement target {} to zonegroup {}'.format(placement_target['placement_id'], zonegroup_name),  # noqa E501  #pylint: disable=line-too-long
-                                                     http_status_code=500, component='rgw')
-                    except SubprocessError as error:
-                        raise DashboardException(error, http_status_code=500, component='rgw')
-                    self.update_period()
+        STANDARD_STORAGE_CLASS = "STANDARD"
+        CLOUD_S3_TIER_TYPE = "cloud-s3"
 
-    def modify_placement_targets(self, zonegroup_name: str, placement_targets: List[Dict]):
-        rgw_add_placement_cmd = ['zonegroup', 'placement', 'modify']
-        for placement_target in placement_targets:
-            cmd_add_placement_options = ['--rgw-zonegroup', zonegroup_name,
-                                         '--placement-id', placement_target['placement_id']]
-            if placement_target['tags']:
+        for placement_target in placement_targets:  # pylint: disable=R1702
+            cmd_add_placement_options = [
+                '--rgw-zonegroup', zonegroup_name,
+                '--placement-id', placement_target['placement_id']
+            ]
+            storage_class_name = placement_target.get('storage_class', None)
+
+            if (
+                placement_target.get('tier_type') == CLOUD_S3_TIER_TYPE
+                and storage_class_name != STANDARD_STORAGE_CLASS
+            ):
+                tier_config = placement_target.get('tier_config', {})
+                if tier_config:
+                    tier_config_items = self.modify_retain_head(tier_config)
+                    tier_config_str = ','.join(tier_config_items)
+                    cmd_add_placement_options += [
+                        '--tier-type', 'cloud-s3', '--tier-config', tier_config_str
+                    ]
+
+            if placement_target.get('tags') and storage_class_name != STANDARD_STORAGE_CLASS:
                 cmd_add_placement_options += ['--tags', placement_target['tags']]
+
+            storage_classes = (
+                placement_target['storage_class'].split(",")
+                if placement_target['storage_class']
+                else []
+            )
             rgw_add_placement_cmd += cmd_add_placement_options
-            storage_classes = placement_target['storage_class'].split(",") if placement_target['storage_class'] else []  # noqa E501  #pylint: disable=line-too-long
-            if storage_classes:
-                for sc in storage_classes:
-                    cmd_add_placement_options = []
-                    cmd_add_placement_options = ['--storage-class', sc]
-                    try:
-                        exit_code, _, err = mgr.send_rgwadmin_command(
-                            rgw_add_placement_cmd + cmd_add_placement_options)
-                        if exit_code > 0:
-                            raise DashboardException(e=err,
-                                                     msg='Unable to add placement target {} to zonegroup {}'.format(placement_target['placement_id'], zonegroup_name),  # noqa E501  #pylint: disable=line-too-long
-                                                     http_status_code=500, component='rgw')
-                    except SubprocessError as error:
-                        raise DashboardException(error, http_status_code=500, component='rgw')
-                    self.update_period()
-            else:
+
+            if not storage_classes:
                 try:
                     exit_code, _, err = mgr.send_rgwadmin_command(rgw_add_placement_cmd)
                     if exit_code > 0:
-                        raise DashboardException(e=err,
-                                                 msg='Unable to add placement target {} to zonegroup {}'.format(placement_target['placement_id'], zonegroup_name),  # noqa E501  #pylint: disable=line-too-long
-                                                 http_status_code=500, component='rgw')
+                        raise DashboardException(
+                            e=err,
+                            msg=(
+                                f'Unable to add placement target '
+                                f'{placement_target["placement_id"]} '
+                                f'to zonegroup {zonegroup_name}'
+                            )
+                        )
                 except SubprocessError as error:
                     raise DashboardException(error, http_status_code=500, component='rgw')
-                self.update_period()
+                self.ensure_realm_and_sync_period()
+
+            if storage_classes:
+                for sc in storage_classes:
+                    if sc == storage_class_name:
+                        cmd_add_placement_options = ['--storage-class', sc]
+                        try:
+                            exit_code, _, err = mgr.send_rgwadmin_command(
+                                rgw_add_placement_cmd + cmd_add_placement_options
+                            )
+                            if exit_code > 0:
+                                raise DashboardException(
+                                    e=err,
+                                    msg=(
+                                        f'Unable to add placement target '
+                                        f'{placement_target["placement_id"]} '
+                                        f'to zonegroup {zonegroup_name}'
+                                    ),
+                                    http_status_code=500,
+                                    component='rgw'
+                                )
+                        except SubprocessError as error:
+                            raise DashboardException(error, http_status_code=500, component='rgw')
+                        self.ensure_realm_and_sync_period()
+
+    def modify_placement_targets(self, zonegroup_name: str, placement_targets: List[Dict]):
+        rgw_add_placement_cmd = ['zonegroup', 'placement', 'modify']
+        STANDARD_STORAGE_CLASS = "STANDARD"
+        CLOUD_S3_TIER_TYPE = "cloud-s3"
+
+        for placement_target in placement_targets:  # pylint: disable=R1702,line-too-long # noqa: E501
+            cmd_add_placement_options = [
+                '--rgw-zonegroup', zonegroup_name,
+                '--placement-id', placement_target['placement_id']
+            ]
+            storage_class_name = placement_target.get('storage_class', None)
+
+            if (
+                placement_target.get('tier_type') == CLOUD_S3_TIER_TYPE
+                and storage_class_name != STANDARD_STORAGE_CLASS
+            ):
+                tier_config = placement_target.get('tier_config', {})
+                if tier_config:
+                    tier_config_items = self.modify_retain_head(tier_config)
+                    tier_config_str = ','.join(tier_config_items)
+                    cmd_add_placement_options += [
+                        '--tier-type', 'cloud-s3', '--tier-config', tier_config_str
+                    ]
+
+            if placement_target.get('tags') and storage_class_name != STANDARD_STORAGE_CLASS:
+                cmd_add_placement_options += ['--tags', placement_target['tags']]
+
+            storage_classes = (
+                placement_target['storage_class'].split(",")
+                if placement_target['storage_class']
+                else []
+            )
+            rgw_add_placement_cmd += cmd_add_placement_options
+
+            if not storage_classes:
+                try:
+                    exit_code, _, err = mgr.send_rgwadmin_command(rgw_add_placement_cmd)
+                    if exit_code > 0:
+                        raise DashboardException(
+                            e=err,
+                            msg=(
+                                f'Unable to add placement target '
+                                f'{placement_target["placement_id"]} '
+                                f'to zonegroup {zonegroup_name}'
+                            )
+                        )
+                except SubprocessError as error:
+                    raise DashboardException(error, http_status_code=500, component='rgw')
+                self.ensure_realm_and_sync_period()
+
+            if storage_classes:
+                for sc in storage_classes:
+                    if sc == storage_class_name:
+                        cmd_add_placement_options = ['--storage-class', sc]
+                        try:
+                            exit_code, _, err = mgr.send_rgwadmin_command(
+                                rgw_add_placement_cmd + cmd_add_placement_options
+                            )
+                            if exit_code > 0:
+                                raise DashboardException(
+                                    e=err,
+                                    msg=(
+                                        f'Unable to add placement target '
+                                        f'{placement_target["placement_id"]} '
+                                        f'to zonegroup {zonegroup_name}'
+                                    ),
+                                    http_status_code=500,
+                                    component='rgw'
+                                )
+                        except SubprocessError as error:
+                            raise DashboardException(error, http_status_code=500, component='rgw')
+                        self.ensure_realm_and_sync_period()
+
+    def delete_placement_targets(self, placement_id: str, storage_class: str):
+        rgw_zonegroup_delete_cmd = ['zonegroup', 'placement', 'rm',
+                                    '--placement-id', placement_id,
+                                    '--storage-class', storage_class]
+
+        try:
+            exit_code, _, err = mgr.send_rgwadmin_command(rgw_zonegroup_delete_cmd)
+            if exit_code > 0:
+                raise DashboardException(
+                    e=err,
+                    msg=(f'Unable to delete placement {placement_id} '
+                         f'with storage-class {storage_class}'),
+                    http_status_code=500,
+                    component='rgw'
+                )
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')
+
+        self.ensure_realm_and_sync_period()
 
     # pylint: disable=W0102
     def edit_zonegroup(self, realm_name: str, zonegroup_name: str, new_zonegroup_name: str,
@@ -1976,9 +2288,12 @@ class RgwMultisite:
         except SubprocessError as error:
             raise DashboardException(error, http_status_code=500, component='rgw')
 
-    def get_user_list(self, zoneName: str):
+    def get_user_list(self, zoneName=None, realmName=None):
         user_list = []
-        rgw_user_list_cmd = ['user', 'list', '--rgw-zone', zoneName]
+        if zoneName:
+            rgw_user_list_cmd = ['user', 'list', '--rgw-zone', zoneName]
+        if realmName:
+            rgw_user_list_cmd = ['user', 'list', '--rgw-realm', realmName]
         try:
             exit_code, out, _ = mgr.send_rgwadmin_command(rgw_user_list_cmd)
             if exit_code > 0:
@@ -2361,3 +2676,61 @@ class RgwMultisite:
             return True
         except DashboardException:
             return False
+
+
+class RgwTopicmanagement:
+    def list_topics(self, uid: Optional[str], tenant: Optional[str]):
+        rgw_topics_list = {}
+        rgw_topic_list_cmd = ['topic', 'list']
+        try:
+            if uid:
+                rgw_topic_list_cmd.append('--uid')
+                rgw_topic_list_cmd.append(uid)
+
+            if tenant:
+                rgw_topic_list_cmd.append('--tenant')
+                rgw_topic_list_cmd.append(tenant)
+
+            exit_code, rgw_topics_list, _ = mgr.send_rgwadmin_command(rgw_topic_list_cmd)
+            if exit_code > 0:
+                raise DashboardException(msg='Unable to fetch topic list',
+                                         http_status_code=500, component='rgw')
+            return rgw_topics_list
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')
+
+    def get_topic(self, name: str, tenant: Optional[str]):
+        rgw_topic_info_cmd = ['topic', 'get']
+        try:
+            if tenant:
+                rgw_topic_info_cmd.append('--tenant')
+                rgw_topic_info_cmd.append(tenant)
+
+            if name:
+                rgw_topic_info_cmd.append('--topic')
+                rgw_topic_info_cmd.append(name)
+
+            exit_code, topic_info, _ = mgr.send_rgwadmin_command(rgw_topic_info_cmd)
+            if exit_code > 0:
+                raise DashboardException('Unable to get topic info',
+                                         http_status_code=500, component='rgw')
+            return topic_info
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')
+
+    def delete_topic(self, name: str, tenant: Optional[str] = None):
+        rgw_delete_topic_cmd = ['topic', 'rm']
+        try:
+            if tenant:
+                rgw_delete_topic_cmd.extend(['--tenant', tenant])
+
+            if name:
+                rgw_delete_topic_cmd.extend(['--topic', name])
+
+            exit_code, _, _ = mgr.send_rgwadmin_command(rgw_delete_topic_cmd)
+
+            if exit_code > 0:
+                raise DashboardException(msg='Unable to delete topic',
+                                         http_status_code=500, component='rgw')
+        except SubprocessError as error:
+            raise DashboardException(error, http_status_code=500, component='rgw')

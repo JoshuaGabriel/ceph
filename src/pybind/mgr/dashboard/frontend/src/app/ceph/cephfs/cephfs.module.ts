@@ -2,7 +2,6 @@ import { CommonModule } from '@angular/common';
 import { NgModule } from '@angular/core';
 import { FormsModule, ReactiveFormsModule } from '@angular/forms';
 
-import { TreeModule } from '@circlon/angular-tree-component';
 import {
   NgbDatepickerModule,
   NgbNavModule,
@@ -10,7 +9,7 @@ import {
   NgbTooltipModule,
   NgbTypeaheadModule
 } from '@ng-bootstrap/ng-bootstrap';
-import { NgChartsModule } from 'ng2-charts';
+import { provideCharts, withDefaultRegisterables, BaseChartDirective } from 'ng2-charts';
 
 import { AppRoutingModule } from '~/app/app-routing.module';
 import { SharedModule } from '~/app/shared/shared.module';
@@ -47,10 +46,12 @@ import {
   NumberModule,
   PlaceholderModule,
   SelectModule,
-  TimePickerModule
+  TimePickerModule,
+  TreeviewModule
 } from 'carbon-components-angular';
 
 import AddIcon from '@carbon/icons/es/add/32';
+import LaunchIcon from '@carbon/icons/es/launch/32';
 import Close from '@carbon/icons/es/close/32';
 import Trash from '@carbon/icons/es/trash-can/32';
 
@@ -59,8 +60,7 @@ import Trash from '@carbon/icons/es/trash-can/32';
     CommonModule,
     SharedModule,
     AppRoutingModule,
-    NgChartsModule,
-    TreeModule,
+    TreeviewModule,
     NgbNavModule,
     FormsModule,
     ReactiveFormsModule,
@@ -83,7 +83,8 @@ import Trash from '@carbon/icons/es/trash-can/32';
     NumberModule,
     LayoutModule,
     ComboBoxModule,
-    IconModule
+    IconModule,
+    BaseChartDirective
   ],
   declarations: [
     CephfsDetailComponent,
@@ -104,10 +105,11 @@ import Trash from '@carbon/icons/es/trash-can/32';
     CephfsSubvolumeSnapshotsFormComponent,
     CephfsMountDetailsComponent,
     CephfsAuthModalComponent
-  ]
+  ],
+  providers: [provideCharts(withDefaultRegisterables())]
 })
 export class CephfsModule {
   constructor(private iconService: IconService) {
-    this.iconService.registerAll([AddIcon, Close, Trash]);
+    this.iconService.registerAll([AddIcon, LaunchIcon, Close, Trash]);
   }
 }

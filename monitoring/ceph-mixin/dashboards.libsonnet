@@ -9,5 +9,8 @@
     (import 'dashboards/ceph-cluster.libsonnet') +
     (import 'dashboards/rgw-s3-analytics.libsonnet') +
     (import 'dashboards/multi-cluster.libsonnet') +
+    (import 'dashboards/smb-overview.libsonnet') +
+    (import 'dashboards/ceph-nvmeof.libsonnet') +
+    (import 'dashboards/ceph-nvmeof-performance.libsonnet') +
     { _config:: $._config },
 }

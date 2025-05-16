@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <deque>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -14,12 +15,46 @@
 
 #include "include/byteorder.h"
 #include "include/denc.h"
+#include "include/encoding.h"
 #include "include/buffer.h"
 #include "include/intarith.h"
 #include "include/interval_set.h"
 #include "include/uuid.h"
+#include "include/rados.h"
 
 namespace crimson::os::seastore {
+
+class cache_hint_t {
+  enum hint_t {
+    TOUCH,
+    NOCACHE
+  };
+public:
+  static constexpr cache_hint_t get_touch() {
+    return hint_t::TOUCH;
+  }
+  static constexpr cache_hint_t get_nocache() {
+    return hint_t::NOCACHE;
+  }
+  cache_hint_t(uint32_t flags) {
+    if (unlikely(flags & CEPH_OSD_OP_FLAG_FADVISE_DONTNEED) ||
+	unlikely(flags & CEPH_OSD_OP_FLAG_FADVISE_NOCACHE)) {
+      hint = NOCACHE;
+    }
+  }
+  bool operator==(const cache_hint_t &other) const {
+    return hint == other.hint;
+  }
+  bool operator!=(const cache_hint_t &other) const {
+    return hint != other.hint;
+  }
+private:
+  constexpr cache_hint_t(hint_t hint) : hint(hint) {}
+  hint_t hint = hint_t::TOUCH;
+};
+
+inline constexpr cache_hint_t CACHE_HINT_TOUCH = cache_hint_t::get_touch();
+inline constexpr cache_hint_t CACHE_HINT_NOCACHE = cache_hint_t::get_nocache();
 
 /* using a special xattr key "omap_header" to store omap header */
   const std::string OMAP_HEADER_XATTR_KEY = "omap_header";
@@ -530,10 +565,6 @@ public:
     return static_cast<device_id_t>(internal_paddr >> DEVICE_OFF_BITS);
   }
 
-  paddr_types_t get_addr_type() const {
-    return device_id_to_paddr_type(get_device_id());
-  }
-
   paddr_t add_offset(device_off_t o) const;
 
   paddr_t add_relative(paddr_t o) const;
@@ -613,22 +644,42 @@ public:
   }
 
   /**
-   * is_real
+   * is_absolute()
    *
-   * indicates whether addr reflects a physical location, absolute, relative,
-   * or delayed.  FAKE segments also count as real so as to reflect the way in
-   * which unit tests use them.
+   * indicates whether addr reflects an absolute location
+   * which can be found on disk.
+   *
+   * Note, fake paddrs should work like the absolute ones.
    */
-  bool is_real() const {
-    return !is_zero() && !is_null() && !is_root();
+  bool is_absolute() const {
+#ifdef UNIT_TESTS_BUILT
+    return get_addr_type() != paddr_types_t::RESERVED ||
+           is_fake();
+#else
+    return get_addr_type() != paddr_types_t::RESERVED;
+#endif
   }
 
-  bool is_absolute() const {
-    return get_addr_type() != paddr_types_t::RESERVED;
+  bool is_absolute_random_block() const {
+    return get_addr_type() == paddr_types_t::RANDOM_BLOCK;
+  }
+
+  bool is_absolute_segmented() const {
+    return get_addr_type() == paddr_types_t::SEGMENT;
   }
 
   bool is_fake() const {
     return get_device_id() == DEVICE_ID_FAKE;
+  }
+
+  /**
+   * is_real_location
+   *
+   * indicates whether addr reflects a real location (valid in lba) --
+   * absolute, record-relative, or delayed.
+   */
+  bool is_real_location() const {
+    return is_absolute() || is_delayed() || is_record_relative();
   }
 
   auto operator<=>(const paddr_t &) const = default;
@@ -659,7 +710,7 @@ private:
               encode_device_off(offset)) {
     assert(offset >= DEVICE_OFF_MIN);
     assert(offset <= DEVICE_OFF_MAX);
-    assert(get_addr_type() != paddr_types_t::SEGMENT);
+    assert(!is_absolute_segmented());
   }
 
   paddr_t(internal_paddr_t val);
@@ -668,6 +719,10 @@ private:
   constexpr paddr_t(device_id_t d_id, device_off_t offset, const_construct_t)
     : internal_paddr((static_cast<internal_paddr_t>(d_id) << DEVICE_OFF_BITS) |
                      static_cast<u_device_off_t>(offset)) {}
+
+  paddr_types_t get_addr_type() const {
+    return device_id_to_paddr_type(get_device_id());
+  }
 
   friend struct paddr_le_t;
   friend struct pladdr_le_t;
@@ -785,22 +840,22 @@ inline paddr_t make_delayed_temp_paddr(device_off_t off) {
 }
 
 inline const seg_paddr_t& paddr_t::as_seg_paddr() const {
-  assert(get_addr_type() == paddr_types_t::SEGMENT);
+  assert(is_absolute_segmented());
   return *static_cast<const seg_paddr_t*>(this);
 }
 
 inline seg_paddr_t& paddr_t::as_seg_paddr() {
-  assert(get_addr_type() == paddr_types_t::SEGMENT);
+  assert(is_absolute_segmented());
   return *static_cast<seg_paddr_t*>(this);
 }
 
 inline const blk_paddr_t& paddr_t::as_blk_paddr() const {
-  assert(get_addr_type() == paddr_types_t::RANDOM_BLOCK);
+  assert(is_absolute_random_block());
   return *static_cast<const blk_paddr_t*>(this);
 }
 
 inline blk_paddr_t& paddr_t::as_blk_paddr() {
-  assert(get_addr_type() == paddr_types_t::RANDOM_BLOCK);
+  assert(is_absolute_random_block());
   return *static_cast<blk_paddr_t*>(this);
 }
 
@@ -967,18 +1022,15 @@ private:
     }
     using ret_t = std::pair<device_off_t, segment_id_t>;
     auto to_pair = [](const paddr_t &addr) -> ret_t {
-      if (addr.get_addr_type() == paddr_types_t::SEGMENT) {
+      if (addr.is_absolute_segmented()) {
 	auto &seg_addr = addr.as_seg_paddr();
 	return ret_t(seg_addr.get_segment_off(), seg_addr.get_segment_id());
-      } else if (addr.get_addr_type() == paddr_types_t::RANDOM_BLOCK) {
+      } else if (addr.is_absolute_random_block()) {
 	auto &blk_addr = addr.as_blk_paddr();
 	return ret_t(blk_addr.get_device_off(), MAX_SEG_ID);
-      } else if (addr.get_addr_type() == paddr_types_t::RESERVED) {
+      } else {
         auto &res_addr = addr.as_res_paddr();
         return ret_t(res_addr.get_device_off(), MAX_SEG_ID);
-      } else {
-	assert(0 == "impossible");
-	return ret_t(0, MAX_SEG_ID);
       }
     };
     auto left = to_pair(offset);
@@ -1226,7 +1278,6 @@ constexpr laddr_t L_ADDR_MAX = laddr_t::from_raw_uint(laddr_t::RAW_VALUE_MAX);
 constexpr laddr_t L_ADDR_MIN = laddr_t::from_raw_uint(0);
 constexpr laddr_t L_ADDR_NULL = L_ADDR_MAX;
 constexpr laddr_t L_ADDR_ROOT = laddr_t::from_raw_uint(laddr_t::RAW_VALUE_MAX - 1);
-constexpr laddr_t L_ADDR_LBAT = laddr_t::from_raw_uint(laddr_t::RAW_VALUE_MAX - 2);
 
 struct __attribute__((packed)) laddr_le_t {
   ceph_le64 laddr;
@@ -1378,23 +1429,24 @@ enum class extent_types_t : uint8_t {
   LADDR_INTERNAL = 1,
   LADDR_LEAF = 2,
   DINK_LADDR_LEAF = 3, // should only be used for unitttests
-  OMAP_INNER = 4,
-  OMAP_LEAF = 5,
-  ONODE_BLOCK_STAGED = 6,
-  COLL_BLOCK = 7,
-  OBJECT_DATA_BLOCK = 8,
-  RETIRED_PLACEHOLDER = 9,
+  ROOT_META = 4,
+  OMAP_INNER = 5,
+  OMAP_LEAF = 6,
+  ONODE_BLOCK_STAGED = 7,
+  COLL_BLOCK = 8,
+  OBJECT_DATA_BLOCK = 9,
+  RETIRED_PLACEHOLDER = 10,
   // the following two types are not extent types,
   // they are just used to indicates paddr allocation deltas
-  ALLOC_INFO = 10,
-  JOURNAL_TAIL = 11,
+  ALLOC_INFO = 11,
+  JOURNAL_TAIL = 12,
   // Test Block Types
-  TEST_BLOCK = 12,
-  TEST_BLOCK_PHYSICAL = 13,
-  BACKREF_INTERNAL = 14,
-  BACKREF_LEAF = 15,
+  TEST_BLOCK = 13,
+  TEST_BLOCK_PHYSICAL = 14,
+  BACKREF_INTERNAL = 15,
+  BACKREF_LEAF = 16,
   // None and the number of valid extent_types_t
-  NONE = 16,
+  NONE = 17,
 };
 using extent_types_le_t = uint8_t;
 constexpr auto EXTENT_TYPES_MAX = static_cast<uint8_t>(extent_types_t::NONE);
@@ -1409,12 +1461,12 @@ constexpr bool is_data_type(extent_types_t type) {
 }
 
 constexpr bool is_logical_metadata_type(extent_types_t type) {
-  return type >= extent_types_t::OMAP_INNER &&
+  return type >= extent_types_t::ROOT_META &&
          type <= extent_types_t::COLL_BLOCK;
 }
 
 constexpr bool is_logical_type(extent_types_t type) {
-  if ((type >= extent_types_t::OMAP_INNER &&
+  if ((type >= extent_types_t::ROOT_META &&
        type <= extent_types_t::OBJECT_DATA_BLOCK) ||
       type == extent_types_t::TEST_BLOCK) {
     assert(is_logical_metadata_type(type) ||
@@ -1462,6 +1514,23 @@ constexpr bool is_physical_type(extent_types_t type) {
     assert(!is_root_type(type) &&
            !is_lba_backref_node(type) &&
            type != extent_types_t::TEST_BLOCK_PHYSICAL);
+    return false;
+  }
+}
+
+constexpr bool is_backref_mapped_type(extent_types_t type) {
+  if ((type >= extent_types_t::LADDR_INTERNAL &&
+       type <= extent_types_t::OBJECT_DATA_BLOCK) ||
+      type == extent_types_t::TEST_BLOCK ||
+      type == extent_types_t::TEST_BLOCK_PHYSICAL) {
+    assert(is_logical_type(type) ||
+	   is_lba_node(type) ||
+	   type == extent_types_t::TEST_BLOCK_PHYSICAL);
+    return true;
+  } else {
+    assert(!is_logical_type(type) &&
+	   !is_lba_node(type) &&
+	   type != extent_types_t::TEST_BLOCK_PHYSICAL);
     return false;
   }
 }
@@ -1617,8 +1686,8 @@ struct delta_info_t {
   extent_types_t type = extent_types_t::NONE;  ///< delta type
   paddr_t paddr;                               ///< physical address
   laddr_t laddr = L_ADDR_NULL;                 ///< logical address
-  uint32_t prev_crc = 0;
-  uint32_t final_crc = 0;
+  checksum_t prev_crc = 0;
+  checksum_t final_crc = 0;
   extent_len_t length = 0;                     ///< extent length
   extent_version_t pversion;                   ///< prior version
   segment_seq_t ext_seq;		       ///< seq of the extent's segment
@@ -1737,17 +1806,27 @@ struct __attribute__((packed)) object_data_le_t {
   }
 };
 
+enum class omap_type_t : uint8_t {
+  XATTR = 0,
+  OMAP,
+  LOG,
+  NONE
+};
+std::ostream &operator<<(std::ostream &out, const omap_type_t &type);
+
 struct omap_root_t {
   laddr_t addr = L_ADDR_NULL;
   depth_t depth = 0;
   laddr_t hint = L_ADDR_MIN;
   bool mutated = false;
+  omap_type_t type = omap_type_t::NONE;
 
   omap_root_t() = default;
-  omap_root_t(laddr_t addr, depth_t depth, laddr_t addr_min)
+  omap_root_t(laddr_t addr, depth_t depth, laddr_t addr_min, omap_type_t type)
     : addr(addr),
       depth(depth),
-      hint(addr_min) {}
+      hint(addr_min),
+      type(type) {}
 
   omap_root_t(const omap_root_t &o) = default;
   omap_root_t(omap_root_t &&o) = default;
@@ -1762,11 +1841,12 @@ struct omap_root_t {
     return mutated;
   }
   
-  void update(laddr_t _addr, depth_t _depth, laddr_t _hint) {
+  void update(laddr_t _addr, depth_t _depth, laddr_t _hint, omap_type_t _type) {
     mutated = true;
     addr = _addr;
     depth = _depth;
     hint = _hint;
+    type = _type;
   }
   
   laddr_t get_location() const {
@@ -1780,18 +1860,25 @@ struct omap_root_t {
   laddr_t get_hint() const {
     return hint;
   }
+
+  omap_type_t get_type() const {
+    return type;
+  }
 };
 std::ostream &operator<<(std::ostream &out, const omap_root_t &root);
 
 class __attribute__((packed)) omap_root_le_t {
   laddr_le_t addr = laddr_le_t(L_ADDR_NULL);
   depth_le_t depth = init_depth_le(0);
+  omap_type_t type = omap_type_t::NONE;
 
 public: 
   omap_root_le_t() = default;
   
-  omap_root_le_t(laddr_t addr, depth_t depth)
-    : addr(addr), depth(init_depth_le(depth)) {}
+  omap_root_le_t(laddr_t addr, depth_t depth, omap_type_t type)
+    : addr(addr), depth(init_depth_le(depth)), type(type) {}
+
+  omap_root_le_t(omap_type_t type) : type(type) {}
 
   omap_root_le_t(const omap_root_le_t &o) = default;
   omap_root_le_t(omap_root_le_t &&o) = default;
@@ -1801,10 +1888,15 @@ public:
   void update(const omap_root_t &nroot) {
     addr = nroot.get_location();
     depth = init_depth_le(nroot.get_depth());
+    type = nroot.get_type();
   }
   
   omap_root_t get(laddr_t hint) const {
-    return omap_root_t(addr, depth, hint);
+    return omap_root_t(addr, depth, hint, type);
+  }
+  
+  omap_type_t get_type() const {
+    return type;
   }
 };
 
@@ -1926,54 +2018,29 @@ using backref_root_t = phy_tree_root_t;
  * TODO: generalize this to permit more than one lba_manager implementation
  */
 struct __attribute__((packed)) root_t {
-  using meta_t = std::map<std::string, std::string>;
-
-  static constexpr int MAX_META_LENGTH = 1024;
-
   backref_root_t backref_root;
   lba_root_t lba_root;
   laddr_le_t onode_root;
   coll_root_le_t collection_root;
+  laddr_le_t meta;
 
-  char meta[MAX_META_LENGTH];
-
-  root_t() {
-    set_meta(meta_t{});
-  }
+  root_t() = default;
 
   void adjust_addrs_from_base(paddr_t base) {
     lba_root.adjust_addrs_from_base(base);
     backref_root.adjust_addrs_from_base(base);
   }
-
-  meta_t get_meta() {
-    bufferlist bl;
-    bl.append(ceph::buffer::create_static(MAX_META_LENGTH, meta));
-    meta_t ret;
-    auto iter = bl.cbegin();
-    decode(ret, iter);
-    return ret;
-  }
-
-  void set_meta(const meta_t &m) {
-    ceph::bufferlist bl;
-    encode(m, bl);
-    ceph_assert(bl.length() < MAX_META_LENGTH);
-    bl.rebuild();
-    auto &bptr = bl.front();
-    ::memset(meta, 0, MAX_META_LENGTH);
-    ::memcpy(meta, bptr.c_str(), bl.length());
-  }
 };
 
 struct alloc_blk_t {
   alloc_blk_t(
-    paddr_t paddr,
-    laddr_t laddr,
+    const paddr_t& paddr,
+    const laddr_t& laddr,
     extent_len_t len,
     extent_types_t type)
-    : paddr(paddr), laddr(laddr), len(len), type(type)
-  {}
+    : paddr(paddr), laddr(laddr), len(len), type(type) {
+    assert(len > 0);
+  }
 
   explicit alloc_blk_t() = default;
 
@@ -1988,6 +2055,25 @@ struct alloc_blk_t {
     denc(v.len, p);
     denc(v.type, p);
     DENC_FINISH(p);
+  }
+
+  static alloc_blk_t create_alloc(
+      const paddr_t& paddr,
+      const laddr_t& laddr,
+      extent_len_t len,
+      extent_types_t type) {
+    assert(is_backref_mapped_type(type));
+    assert(laddr != L_ADDR_NULL);
+    return alloc_blk_t(paddr, laddr, len, type);
+  }
+
+  static alloc_blk_t create_retire(
+      const paddr_t& paddr,
+      extent_len_t len,
+      extent_types_t type) {
+    assert(is_backref_mapped_type(type) ||
+	   is_retired_placeholder_type(type));
+    return alloc_blk_t(paddr, L_ADDR_NULL, len, type);
   }
 };
 
@@ -2126,6 +2212,10 @@ std::ostream &operator<<(std::ostream &os, transaction_type_t type);
 
 constexpr bool is_valid_transaction(transaction_type_t type) {
   return type < transaction_type_t::MAX;
+}
+
+constexpr bool is_user_transaction(transaction_type_t type) {
+  return type <= transaction_type_t::READ;
 }
 
 constexpr bool is_background_transaction(transaction_type_t type) {
@@ -2784,6 +2874,10 @@ struct cache_size_stats_t {
     ++num_extents;
   }
 
+  void account_parital_in(extent_len_t sz) {
+    size += sz;
+  }
+
   void account_out(extent_len_t sz) {
     assert(size >= sz);
     assert(num_extents > 0);
@@ -2893,7 +2987,7 @@ std::ostream& operator<<(std::ostream&, const dirty_io_stats_printer_t&);
  *   get_caching_extent() -- test only
  *   get_caching_extent_by_type() -- test only
  */
-struct extent_access_stats_t {
+struct cache_access_stats_t {
   uint64_t trans_pending = 0;
   uint64_t trans_dirty = 0;
   uint64_t trans_lru = 0;
@@ -2911,19 +3005,19 @@ struct extent_access_stats_t {
     return cache_dirty + cache_lru;
   }
 
-  uint64_t get_estimated_cache_access() const {
+  uint64_t get_cache_access() const {
     return get_cache_hit() + load_absent;
   }
 
-  uint64_t get_estimated_total_access() const {
-    return get_trans_hit() + get_cache_hit() + load_absent;
+  uint64_t get_total_access() const {
+    return get_trans_hit() + get_cache_access();
   }
 
   bool is_empty() const {
-    return get_estimated_total_access() == 0;
+    return get_total_access() == 0;
   }
 
-  void add(const extent_access_stats_t& o) {
+  void add(const cache_access_stats_t& o) {
     trans_pending += o.trans_pending;
     trans_dirty += o.trans_dirty;
     trans_lru += o.trans_lru;
@@ -2933,7 +3027,7 @@ struct extent_access_stats_t {
     load_present += o.load_present;
   }
 
-  void minus(const extent_access_stats_t& o) {
+  void minus(const cache_access_stats_t& o) {
     trans_pending -= o.trans_pending;
     trans_dirty -= o.trans_dirty;
     trans_lru -= o.trans_lru;
@@ -2951,43 +3045,6 @@ struct extent_access_stats_t {
     cache_lru /= d;
     load_absent /= d;
     load_present /= d;
-  }
-};
-struct extent_access_stats_printer_t {
-  double seconds;
-  const extent_access_stats_t& stats;
-};
-std::ostream& operator<<(std::ostream&, const extent_access_stats_printer_t&);
-
-struct cache_access_stats_t {
-  extent_access_stats_t s;
-  uint64_t cache_absent = 0;
-
-  uint64_t get_cache_access() const {
-    return s.get_cache_hit() + cache_absent;
-  }
-
-  uint64_t get_total_access() const {
-    return s.get_trans_hit() + get_cache_access();
-  }
-
-  bool is_empty() const {
-    return get_total_access() == 0;
-  }
-
-  void add(const cache_access_stats_t& o) {
-    s.add(o.s);
-    cache_absent += o.cache_absent;
-  }
-
-  void minus(const cache_access_stats_t& o) {
-    s.minus(o.s);
-    cache_absent -= o.cache_absent;
-  }
-
-  void divide_by(unsigned d) {
-    s.divide_by(d);
-    cache_absent /= d;
   }
 };
 struct cache_access_stats_printer_t {
@@ -3066,5 +3123,6 @@ template <> struct fmt::formatter<crimson::os::seastore::segment_tail_t> : fmt::
 template <> struct fmt::formatter<crimson::os::seastore::segment_type_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::transaction_type_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<crimson::os::seastore::write_result_t> : fmt::ostream_formatter {};
+template <> struct fmt::formatter<crimson::os::seastore::omap_type_t> : fmt::ostream_formatter {};
 template <> struct fmt::formatter<ceph::buffer::list> : fmt::ostream_formatter {};
 #endif

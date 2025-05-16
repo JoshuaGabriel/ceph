@@ -22,8 +22,6 @@
 #include "include/xlist.h"
 #include "include/elist.h"
 
-#include "common/config.h"
-
 #include "mdstypes.h"
 
 
@@ -217,8 +215,6 @@ public:
 
   void set_cap_id(uint64_t i) { cap_id = i; }
   uint64_t get_cap_id() const { return cap_id; }
-
-  //ceph_seq_t get_last_issue() { return last_issue; }
 
   bool is_suppress() const { return suppress > 0; }
   void inc_suppress() { suppress++; }

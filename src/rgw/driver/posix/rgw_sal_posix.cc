@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include "rgw_multi.h"
 #include "include/scope_guard.h"
+#include "common/Clock.h" // for ceph_clock_now()
 #include "common/errno.h"
 
 #define dout_subsys ceph_subsys_rgw
@@ -2010,6 +2011,11 @@ void POSIXDriver::register_admin_apis(RGWRESTMgr* mgr)
   return next->register_admin_apis(mgr);
 }
 
+bool POSIXDriver::process_expired_objects(const DoutPrefixProvider *dpp,
+	       				                          optional_yield y) {
+  return next->process_expired_objects(dpp, y);
+}
+
 std::unique_ptr<Notification> POSIXDriver::get_notification(rgw::sal::Object* obj,
 			      rgw::sal::Object* src_obj, struct req_state* s,
 			      rgw::notify::EventType event_type, optional_yield y,
@@ -2462,7 +2468,7 @@ int POSIXBucket::set_acl(const DoutPrefixProvider* dpp,
   return write_attrs(dpp, y);
 }
 
-int POSIXBucket::read_stats(const DoutPrefixProvider *dpp,
+int POSIXBucket::read_stats(const DoutPrefixProvider *dpp, optional_yield y,
 			    const bucket_index_layout_generation& idx_layout,
 			    int shard_id, std::string* bucket_ver, std::string* master_ver,
 			    std::map<RGWObjCategory, RGWStorageStats>& stats,
@@ -2471,14 +2477,14 @@ int POSIXBucket::read_stats(const DoutPrefixProvider *dpp,
   auto& main = stats[RGWObjCategory::Main];
 
   // TODO: bucket stats shouldn't have to list all objects
-  return dir->for_each(dpp, [this, dpp, &main] (const char* name) {
+  return dir->for_each(dpp, [this, dpp, y, &main] (const char* name) {
     if (name[0] == '.') {
       /* Skip dotfiles */
       return 0;
     }
 
     std::unique_ptr<FSEnt> dent;
-    int ret = dir->get_ent(dpp, null_yield, name, std::string(), dent);
+    int ret = dir->get_ent(dpp, y, name, std::string(), dent);
     if (ret < 0) {
       ret = errno;
       ldpp_dout(dpp, 0) << "ERROR: could not get ent for object " << name << ": "
@@ -2611,17 +2617,19 @@ int POSIXBucket::remove_objs_from_index(const DoutPrefixProvider *dpp, std::list
   return 0;
 }
 
-int POSIXBucket::check_index(const DoutPrefixProvider *dpp, std::map<RGWObjCategory, RGWStorageStats>& existing_stats, std::map<RGWObjCategory, RGWStorageStats>& calculated_stats)
+int POSIXBucket::check_index(const DoutPrefixProvider *dpp, optional_yield y,
+                             std::map<RGWObjCategory, RGWStorageStats>& existing_stats,
+                             std::map<RGWObjCategory, RGWStorageStats>& calculated_stats)
 {
   return 0;
 }
 
-int POSIXBucket::rebuild_index(const DoutPrefixProvider *dpp)
+int POSIXBucket::rebuild_index(const DoutPrefixProvider *dpp, optional_yield y)
 {
   return 0;
 }
 
-int POSIXBucket::set_tag_timeout(const DoutPrefixProvider *dpp, uint64_t timeout)
+int POSIXBucket::set_tag_timeout(const DoutPrefixProvider *dpp, optional_yield y, uint64_t timeout)
 {
   return 0;
 }
@@ -2893,6 +2901,20 @@ int POSIXObject::copy_object(const ACLOwner& owner,
   return dobj->set_obj_attrs(dpp, &attrs, nullptr, y, rgw::sal::FLAG_LOG_OP);
 }
 
+int POSIXObject::list_parts(const DoutPrefixProvider* dpp, CephContext* cct,
+			    int max_parts, int marker, int* next_marker,
+			    bool* truncated, list_parts_each_t each_func,
+			    optional_yield y)
+{
+  return -EOPNOTSUPP;
+}
+
+bool POSIXObject::is_sync_completed(const DoutPrefixProvider* dpp, optional_yield y,
+                                    const ceph::real_time& obj_mtime)
+{
+  return false;
+}
+
 int POSIXObject::load_obj_state(const DoutPrefixProvider* dpp, optional_yield y, bool follow_olh)
 {
   int ret = stat(dpp);
@@ -2949,7 +2971,7 @@ int POSIXObject::get_obj_attrs(optional_yield y, const DoutPrefixProvider* dpp,
 }
 
 int POSIXObject::modify_obj_attrs(const char* attr_name, bufferlist& attr_val,
-                               optional_yield y, const DoutPrefixProvider* dpp)
+                               optional_yield y, const DoutPrefixProvider* dpp, uint32_t flags)
 {
   state.attrset[attr_name] = attr_val;
   return write_attrs(dpp, y);
@@ -3045,7 +3067,6 @@ int POSIXObject::restore_obj_from_cloud(Bucket* bucket,
           rgw_bucket_dir_entry& o,
 	  CephContext* cct,
           RGWObjTier& tier_config,
-          real_time& mtime,
           uint64_t olh_epoch,
           std::optional<uint64_t> days,
           const DoutPrefixProvider* dpp, 

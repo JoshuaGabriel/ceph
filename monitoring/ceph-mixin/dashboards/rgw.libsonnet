@@ -46,6 +46,20 @@ local g = import 'grafonnet/grafana.libsonnet';
         'dashboard'
       )
     )
+    .addLinks([
+      $.addLinkSchema(
+        asDropdown=true,
+        icon='external link',
+        includeVars=true,
+        keepTime=true,
+        tags=[],
+        targetBlank=false,
+        title='Browse Dashboards',
+        tooltip='',
+        type='dashboards',
+        url=''
+      ),
+    ])
     .addRequired(
       type='grafana', id='grafana', name='Grafana', version='5.0.0'
     )
@@ -217,6 +231,20 @@ local g = import 'grafonnet/grafana.libsonnet';
         'dashboard'
       )
     )
+    .addLinks([
+      $.addLinkSchema(
+        asDropdown=true,
+        icon='external link',
+        includeVars=true,
+        keepTime=true,
+        tags=[],
+        targetBlank=false,
+        title='Browse Dashboards',
+        tooltip='',
+        type='dashboards',
+        url=''
+      ),
+    ])
     .addRequired(
       type='grafana', id='grafana', name='Grafana', version='5.0.0'
     )
@@ -298,7 +326,7 @@ local g = import 'grafonnet/grafana.libsonnet';
           label_replace(
             rate(ceph_rgw_op_get_obj_lat_sum{%(matchers)s}[$__rate_interval]) /
               rate(ceph_rgw_op_get_obj_lat_count{%(matchers)s}[$__rate_interval]) *
-              on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{%(matchers)s},
+              on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{ceph_daemon=~"$rgw_servers", %(matchers)s},
             "rgw_host", "$1", "ceph_daemon", "rgw.(.*)"
           )
         ||| % $.matchers(),
@@ -314,7 +342,7 @@ local g = import 'grafonnet/grafana.libsonnet';
               label_replace(
                 rate(ceph_rgw_op_put_obj_lat_sum{%(matchers)s}[$__rate_interval]) /
                   rate(ceph_rgw_op_put_obj_lat_count{%(matchers)s}[$__rate_interval]) *
-                  on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{%(matchers)s},
+                  on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{ceph_daemon=~"$rgw_servers", %(matchers)s},
                 "rgw_host", "$1", "ceph_daemon", "rgw.(.*)"
               )
             ||| % $.matchers(),
@@ -331,7 +359,7 @@ local g = import 'grafonnet/grafana.libsonnet';
           sum by (rgw_host) (
             label_replace(
               rate(ceph_rgw_req{%(matchers)s}[$__rate_interval]) *
-                on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{%(matchers)s},
+                on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{ceph_daemon=~"$rgw_servers", %(matchers)s},
               "rgw_host", "$1", "ceph_daemon", "rgw.(.*)"
             )
           )
@@ -351,7 +379,7 @@ local g = import 'grafonnet/grafana.libsonnet';
           label_replace(
             rate(ceph_rgw_op_get_obj_lat_sum{%(matchers)s}[$__rate_interval]) /
               rate(ceph_rgw_op_get_obj_lat_count{%(matchers)s}[$__rate_interval]) *
-              on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{%(matchers)s},
+              on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{ceph_daemon=~"$rgw_servers", %(matchers)s},
             "rgw_host", "$1", "ceph_daemon", "rgw.(.*)"
           )
         ||| % $.matchers(),
@@ -385,7 +413,7 @@ local g = import 'grafonnet/grafana.libsonnet';
           label_replace(sum by (instance_id) (
             rate(ceph_rgw_op_get_obj_bytes{%(matchers)s}[$__rate_interval]) +
               rate(ceph_rgw_op_put_obj_bytes{%(matchers)s}[$__rate_interval])) *
-              on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{%(matchers)s},
+              on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{ceph_daemon=~"$rgw_servers", %(matchers)s},
             "rgw_host", "$1", "ceph_daemon", "rgw.(.*)"
           )
         ||| % $.matchers(),
@@ -404,7 +432,7 @@ local g = import 'grafonnet/grafana.libsonnet';
           label_replace(
             rate(ceph_rgw_op_put_obj_lat_sum{%(matchers)s}[$__rate_interval]) /
               rate(ceph_rgw_op_put_obj_lat_count{%(matchers)s}[$__rate_interval]) *
-              on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{%(matchers)s},
+              on (instance_id) group_left (ceph_daemon) ceph_rgw_metadata{ceph_daemon=~"$rgw_servers", %(matchers)s},
             "rgw_host", "$1", "ceph_daemon", "rgw.(.*)"
           )
         ||| % $.matchers(),
@@ -725,6 +753,20 @@ local g = import 'grafonnet/grafana.libsonnet';
         'dashboard'
       )
     )
+    .addLinks([
+      $.addLinkSchema(
+        asDropdown=true,
+        icon='external link',
+        includeVars=true,
+        keepTime=true,
+        tags=[],
+        targetBlank=false,
+        title='Browse Dashboards',
+        tooltip='',
+        type='dashboards',
+        url=''
+      ),
+    ])
     .addRequired(
       type='grafana', id='grafana', name='Grafana', version='5.0.0'
     )

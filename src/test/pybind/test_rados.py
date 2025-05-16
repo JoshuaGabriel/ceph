@@ -207,7 +207,7 @@ class TestRados(object):
 
     def test_get_fsid(self):
         fsid = self.rados.get_fsid()
-        assert re.match('[0-9a-f\-]{36}', fsid, re.I)
+        assert re.match(r'[0-9a-f\-]{36}', fsid, re.I)
 
     def test_blocklist_add(self):
         self.rados.blocklist_add("1.2.3.4/123", 1)
@@ -514,6 +514,11 @@ class TestIoctx(object):
             write_op.zero(2, 2)
             self.ioctx.operate_write_op(write_op, "write_ops")
             eq(self.ioctx.read('write_ops'), b'12\x00\x005')
+
+            write_op.write_full(b'12345')
+            write_op.zero(0, 2)
+            self.ioctx.operate_write_op(write_op, "write_ops")
+            eq(self.ioctx.read('write_ops'), b'\x00\x00345')
 
             write_op.write_full(b'12345')
             write_op.truncate(2)
