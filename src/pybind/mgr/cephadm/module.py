@@ -2524,7 +2524,7 @@ Then run the following:
                 result.append(dd)
         return result
 
-    def perform_service_action(self, action: str, service_name: str, force: bool = False) -> List[str]:
+    def perform_service_action(self, action: str, service_name: str, force: bool = True) -> List[str]:
         dds: List[DaemonDescription] = self.cache.get_daemons_by_service(service_name)
         if not dds:
             raise OrchestratorError(f'No daemons exist under service name "{service_name}".'
@@ -2536,7 +2536,7 @@ Then run the following:
         ]
 
     @handle_orch_error
-    def service_action(self, action: str, service_name: str, force: bool = False) -> List[str]:
+    def service_action(self, action: str, service_name: str, force: bool = True) -> List[str]:
         if service_name not in self.spec_store.all_specs.keys():
             raise OrchestratorError(f'Invalid service name "{service_name}".'
                                     + ' View currently running services using "ceph orch ls"')
@@ -2657,7 +2657,7 @@ Then run the following:
             })
 
     @handle_orch_error
-    def daemon_action(self, action: str, daemon_name: str, image: Optional[str] = None, force: bool = False) -> str:
+    def daemon_action(self, action: str, daemon_name: str, image: Optional[str] = None, force: bool = True) -> str:
         d = self.cache.get_daemon(daemon_name)
         assert d.daemon_type is not None
         assert d.daemon_id is not None
@@ -2696,7 +2696,7 @@ Then run the following:
             self.cache.get_daemons_by_type('mgr')).container_image_digests
         return digests if digests else []
 
-    def _schedule_daemon_action(self, daemon_name: str, action: str, force: bool = False) -> str:
+    def _schedule_daemon_action(self, daemon_name: str, action: str, force: bool = True) -> str:
         dd = self.cache.get_daemon(daemon_name)
         assert dd.daemon_type is not None
         assert dd.daemon_id is not None

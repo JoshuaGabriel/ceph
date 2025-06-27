@@ -390,11 +390,11 @@ class TestCephadm(object):
 
                 d_name = 'rgw.' + daemon_id
 
-                c = cephadm_module.daemon_action('redeploy', d_name)
+                c = cephadm_module.daemon_action('redeploy', d_name, force=False)
                 assert wait(cephadm_module,
                             c) == f"Scheduled to redeploy rgw.{daemon_id} on host 'test'"
 
-                c = cephadm_module.daemon_action('start', d_name)
+                c = cephadm_module.daemon_action('start', d_name, force=False)
                 assert wait(cephadm_module,
                             c) == F"Scheduled to start {d_name} on host 'test'"
 
@@ -405,7 +405,7 @@ class TestCephadm(object):
 
                 for what in ('stop', 'restart'):
                     with pytest.raises(OrchestratorError, match=f"Unable to {what} daemon {d_name}"):
-                        c = cephadm_module.daemon_action(what, d_name)
+                        c = cephadm_module.daemon_action(what, d_name, force=False)
                         wait(cephadm_module, c)
 
                 # Make sure, _check_daemons does a redeploy due to monmap change:
@@ -2899,7 +2899,7 @@ Traceback (most recent call last):
             with with_service(cephadm_module, RGWSpec(service_id='foo'), CephadmOrchestrator.apply_rgw, 'test') as d_names:
                 [daemon_name] = d_names
 
-                cephadm_module._schedule_daemon_action(daemon_name, 'restart')
+                cephadm_module._schedule_daemon_action(daemon_name, 'restart', force=False)
                 assert cephadm_module.cache.get_scheduled_daemon_action('test', daemon_name) == 'restart'
 
                 actions = wait(cephadm_module, cephadm_module.list_daemon_actions())
@@ -2931,7 +2931,7 @@ Traceback (most recent call last):
             with with_service(cephadm_module, RGWSpec(service_id='foo'), CephadmOrchestrator.apply_rgw, 'test') as d_names:
                 [daemon_name] = d_names
 
-                cephadm_module._schedule_daemon_action(daemon_name, 'stop')
+                cephadm_module._schedule_daemon_action(daemon_name, 'stop', force=False)
                 assert cephadm_module.cache.get_scheduled_daemon_action('test', daemon_name) == 'stop'
 
                 actions = wait(cephadm_module, cephadm_module.list_daemon_actions())
@@ -2957,7 +2957,7 @@ Traceback (most recent call last):
             with with_service(cephadm_module, RGWSpec(service_id='foo'), CephadmOrchestrator.apply_rgw, 'test') as d_names:
                 [daemon_name] = d_names
 
-                cephadm_module._schedule_daemon_action(daemon_name, 'stop')
+                cephadm_module._schedule_daemon_action(daemon_name, 'stop', force=False)
                 assert cephadm_module.cache.get_scheduled_daemon_action('test', daemon_name) == 'stop'
 
                 assert cephadm_module.cache.is_force_action('test', daemon_name) is False
