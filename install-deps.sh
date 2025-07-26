@@ -390,7 +390,7 @@ else
     [ $WITH_PMEM ] && with_pmem=true || with_pmem=false
     source /etc/os-release
     case "$ID" in
-    debian|ubuntu|devuan|elementary|softiron)
+    debian|ubuntu|devuan|elementary|softiron|pop)
         echo "Using apt-get to install dependencies"
 	# Put this before any other invocation of apt so it can clean
 	# up in a broken case.
