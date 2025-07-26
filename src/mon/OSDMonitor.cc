@@ -11398,6 +11398,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
   } else if (prefix == "osd crush reweight-by-scaling-factor" ||
              prefix == "osd crush test-reweight-by-scaling-factor") {
 
+    ostringstream output_ss;
+
     bool really = false;
     cmd_getval(cmdmap, "yes_i_really_mean_it", really);
 
@@ -11407,18 +11409,18 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     bool dry_run = prefix == "osd crush test-reweight-by-scaling-factor";
 
     if (skip_metadata_lookup)
-      ss << "reweighting all OSDs using scaling factor "
-         << g_conf().get_val<double>("osd_crush_scaling_factor") << ":";
+      output_ss << "reweighting all OSDs using scaling factor "
+         << osdmap.get_osd_crush_scaling_factor() << ":\n";
     else
-      ss << "reweighting all OSDs using scaling factor "
-         << g_conf().get_val<double>("osd_crush_scaling_factor")
-         << " based on device size metadata:";
+      output_ss << "reweighting all OSDs using scaling factor "
+         << osdmap.get_osd_crush_scaling_factor()
+         << " based on device size metadata:\n";
 
     if (dry_run)
-      ss << "This is a dry run, no changes will be made. "
+      output_ss << "This is a dry run, no changes will be made. "
          << "Use 'test-reweight-by-scaling-factor -o newcrush' "
          << "then 'crushdiff compare -c newcrush' "
-         << "to check if this will cause data movement.";
+         << "to check if this will cause data movement.\n";
 
     CrushWrapper newcrush = _get_pending_crush();
 
@@ -11427,7 +11429,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
           // weight is 0, skip
           continue;
         }
-        double new_weight = g_conf().get_val<double>("osd_crush_scaling_factor") *
+        double new_weight = osdmap.get_osd_crush_scaling_factor() *
                                    newcrush.get_item_weightf(id);
 
         if (!skip_metadata_lookup) {
@@ -11456,12 +11458,12 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 
           // use the same calculation as OSD::update_crush_location
           new_weight = std::max(0.00001,
-                                g_conf().get_val<double>("osd_crush_scaling_factor") *
+                                osdmap.get_osd_crush_scaling_factor() *
                                 double(total_size) /
                                 double(1ull << 40));
         }
 
-        ss << "reweighting osd." << id << " to " << new_weight;
+        output_ss << "reweighting osd." << id << " to " << new_weight << "\n";
 
         err = newcrush.adjust_item_weightf(cct, id, new_weight,
                                            g_conf()->osd_crush_update_weight_set);
@@ -11472,27 +11474,31 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     if (dry_run) {
       // return the new crush map without committing
       newcrush.encode(rdata, mon.get_quorum_con_features());
-      ss << "test reweighted all crush weights by scaling factor "
-         << g_conf().get_val<double>("osd_crush_scaling_factor");
-      return true;
+      output_ss << "\ntest reweighted all crush weights by scaling factor "
+         << osdmap.get_osd_crush_scaling_factor();
+      rs = output_ss.str();
+      goto reply_no_propose;
     }
 
-    if (!really) {
+    if (!dry_run && !really) {
+      rdata.append(output_ss.str());
+
       ss << "WARNING: this will reweight all crush weights by scaling factor "
-        << g_conf().get_val<double>("osd_crush_scaling_factor")
-        << " and may cause data movement."
+        << osdmap.get_osd_crush_scaling_factor()
+        << " and may cause data movement. "
         "If you are certain that is what you want, "
-        "pass the flag --yes-i-really-mean-it.";
-      return -EPERM;
+        "pass the flag --yes-i-really-mean-it.\n";
+      err = -EPERM;
+      goto reply_no_propose;
     }
 
     pending_inc.crush.clear();
     newcrush.encode(pending_inc.crush, mon.get_quorum_con_features());
-    ss << "reweighted all crush weights by scaling factor "
-       << g_conf().get_val<double>("osd_crush_scaling_factor");
-    getline(ss, rs);
+    output_ss << "reweighted all crush weights by scaling factor "
+       << osdmap.get_osd_crush_scaling_factor();
+    rs = output_ss.str();
     wait_for_commit(op, new Monitor::C_Command(mon, op, 0, rs,
-						  get_last_committed() + 1));
+					      get_last_committed() + 1));
     return true;
   } else if (prefix == "osd crush reweight-subtree") {
     // osd crush reweight <name> <weight>
@@ -11995,6 +12001,25 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       pending_inc.new_backfillfull_ratio = n;
     else if (prefix == "osd set-nearfull-ratio")
       pending_inc.new_nearfull_ratio = n;
+    ss << prefix << " " << n;
+    getline(ss, rs);
+    wait_for_commit(op, new Monitor::C_Command(mon, op, 0, rs,
+					      get_last_committed() + 1));
+    return true;
+  } else if (prefix == "osd set-crush-scaling-factor") {
+    double n;
+    if (!cmd_getval(cmdmap, "factor", n)){
+      ss << "unable to parse 'factor' value '"
+         << cmd_vartype_stringify(cmdmap.at("factor")) << "'";
+      err = -EINVAL;
+      goto reply_no_propose;
+    }
+    if (n < 0.001 || n > 1.0) {
+      ss << "scaling factor must be between 0.001 and 1.0";
+      err = -EINVAL;
+      goto reply_no_propose;
+    }
+    pending_inc.new_osd_crush_scaling_factor = n;
     ss << prefix << " " << n;
     getline(ss, rs);
     wait_for_commit(op, new Monitor::C_Command(mon, op, 0, rs,
