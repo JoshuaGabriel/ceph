@@ -777,7 +777,7 @@ public:
     return nearfull_ratio;
   }
 
-  float get_osd_crush_scaling_factor() const{
+  float get_osd_crush_scaling_factor() const {
     return osd_crush_scaling_factor;
   }
 

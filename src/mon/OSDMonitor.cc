@@ -11408,74 +11408,75 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 
     bool dry_run = prefix == "osd crush test-reweight-by-scaling-factor";
 
-    if (skip_metadata_lookup)
+    if (skip_metadata_lookup) {
       output_ss << "reweighting all OSDs using scaling factor "
-         << osdmap.get_osd_crush_scaling_factor() << ":\n";
-    else
+                << osdmap.get_osd_crush_scaling_factor() << ":\n";
+    } else {
       output_ss << "reweighting all OSDs using scaling factor "
-         << osdmap.get_osd_crush_scaling_factor()
-         << " based on device size metadata:\n";
-
-    if (dry_run)
+                << osdmap.get_osd_crush_scaling_factor()
+                << " based on device size metadata:\n";
+    }
+    if (dry_run){
       output_ss << "This is a dry run, no changes will be made. "
-         << "Use 'test-reweight-by-scaling-factor -o newcrush' "
-         << "then 'crushdiff compare -c newcrush' "
-         << "to check if this will cause data movement.\n";
-
+                << "Use 'test-reweight-by-scaling-factor -o newcrush' "
+                << "then 'crushdiff compare -c newcrush' "
+                << "to check if this will cause data movement.\n";
+    }
     CrushWrapper newcrush = _get_pending_crush();
 
     for (int id = 0; id < newcrush.get_max_devices(); ++id) {
-        if (!newcrush.get_item_weight(id)) {
-          // weight is 0, skip
-          continue;
-        }
-        double new_weight = osdmap.get_osd_crush_scaling_factor() *
-                                   newcrush.get_item_weightf(id);
+      if (!newcrush.get_item_weight(id)) {
+        // weight is 0, skip
+        continue;
+      }
+      double new_weight =
+          osdmap.get_osd_crush_scaling_factor() * newcrush.get_item_weightf(id);
 
-        if (!skip_metadata_lookup) {
-          map<string,string> meta;
-          err = load_metadata(id, meta, nullptr);
-          if (err < 0) {
-            ss << "failed to load metadata for osd." << id
-               << ": " << cpp_strerror(err);
-            goto reply_no_propose;
-          }
-
-          // osd statfs.total is bluestore_bdev_size + bluefs_db_size
-          uint64_t total_size = 0;
-          auto p1 = meta.find("bluestore_bdev_size");
-          if (p1 == meta.end()) {
-            ss << "osd." << id << " does not have bluestore_bdev_size metadata";
-            goto reply_no_propose;
-          }
-          total_size = std::stoull(p1->second);
-          auto p2 = meta.find("bluefs_db_size");
-          if (p2 == meta.end()) {
-            ss << "osd." << id << " does not have bluefs_db_size metadata";
-            goto reply_no_propose;
-          }
-          total_size += std::stoull(p2->second);
-
-          // use the same calculation as OSD::update_crush_location
-          new_weight = std::max(0.00001,
-                                osdmap.get_osd_crush_scaling_factor() *
-                                double(total_size) /
-                                double(1ull << 40));
-        }
-
-        output_ss << "reweighting osd." << id << " to " << new_weight << "\n";
-
-        err = newcrush.adjust_item_weightf(cct, id, new_weight,
-                                           g_conf()->osd_crush_update_weight_set);
-        if (err < 0)
+      if (!skip_metadata_lookup) {
+        map<string, string> meta;
+        err = load_metadata(id, meta, nullptr);
+        if (err < 0) {
+          ss << "failed to load metadata for osd." << id << ": "
+             << cpp_strerror(err);
           goto reply_no_propose;
+        }
+
+        // TODO: support other store than bluestore
+        // osd statfs.total is bluestore_bdev_size + bluefs_db_size
+        uint64_t total_size = 0;
+        auto p1 = meta.find("bluestore_bdev_size");
+        if (p1 == meta.end()) {
+          ss << "osd." << id << " does not have bluestore_bdev_size metadata";
+          goto reply_no_propose;
+        }
+        total_size = std::stoull(p1->second);
+        auto p2 = meta.find("bluefs_db_size");
+        if (p2 == meta.end()) {
+          ss << "osd." << id << " does not have bluefs_db_size metadata";
+          goto reply_no_propose;
+        }
+        total_size += std::stoull(p2->second);
+
+        // use the same calculation as OSD::update_crush_location
+        new_weight =
+            std::max(0.00001, osdmap.get_osd_crush_scaling_factor() *
+                                  double(total_size) / double(1ull << 40));
+      }
+
+      output_ss << "reweighting osd." << id << " to " << new_weight << "\n";
+
+      err = newcrush.adjust_item_weightf(cct, id, new_weight,
+                                         g_conf()->osd_crush_update_weight_set);
+      if (err < 0) {
+        goto reply_no_propose;
+      }
     }
 
     if (dry_run) {
       // return the new crush map without committing
       newcrush.encode(rdata, mon.get_quorum_con_features());
       output_ss << "\ntest reweighted all crush weights by scaling factor "
-         << osdmap.get_osd_crush_scaling_factor();
+                << osdmap.get_osd_crush_scaling_factor();
       rs = output_ss.str();
       goto reply_no_propose;
     }
@@ -11484,10 +11485,10 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       rdata.append(output_ss.str());
 
       ss << "WARNING: this will reweight all crush weights by scaling factor "
-        << osdmap.get_osd_crush_scaling_factor()
-        << " and may cause data movement. "
-        "If you are certain that is what you want, "
-        "pass the flag --yes-i-really-mean-it.\n";
+         << osdmap.get_osd_crush_scaling_factor()
+         << " and may cause data movement. "
+            "If you are certain that is what you want, "
+            "pass the flag --yes-i-really-mean-it.\n";
       err = -EPERM;
       goto reply_no_propose;
     }
@@ -11495,10 +11496,10 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     pending_inc.crush.clear();
     newcrush.encode(pending_inc.crush, mon.get_quorum_con_features());
     output_ss << "reweighted all crush weights by scaling factor "
-       << osdmap.get_osd_crush_scaling_factor();
+              << osdmap.get_osd_crush_scaling_factor();
     rs = output_ss.str();
-    wait_for_commit(op, new Monitor::C_Command(mon, op, 0, rs,
-					      get_last_committed() + 1));
+    wait_for_commit(
+        op, new Monitor::C_Command(mon, op, 0, rs, get_last_committed() + 1));
     return true;
   } else if (prefix == "osd crush reweight-subtree") {
     // osd crush reweight <name> <weight>

@@ -1021,7 +1021,7 @@ void OSDMap::Incremental::decode(ceph::buffer::list::const_iterator& bl)
     if (struct_v >= 12) {
       decode(mutate_allow_crimson, bl);
     }
-    if (struct_v >= 13){
+    if (struct_v >= 13) {
       decode(new_osd_crush_scaling_factor, bl);
     } else {
       new_osd_crush_scaling_factor = -1.0;
@@ -2622,7 +2622,7 @@ int OSDMap::apply_incremental(const Incremental &inc)
     break;
   }
 
-  if (inc.new_osd_crush_scaling_factor >= 0){
+  if (inc.new_osd_crush_scaling_factor >= 0) {
     osd_crush_scaling_factor = inc.new_osd_crush_scaling_factor;
   }
 
