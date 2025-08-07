@@ -1,0 +1,43 @@
+tasks:
+- cephadm.apply:
+    specs:
+      - service_type: rgw
+        service_id: foo
+        placement:
+          host_pattern: "*"
+        spec:
+          rgw_frontend_port: 8080
+
+# it will be named rgw.foo for some reason
+- cephadm.wait_for_service:
+    service: rgw.foo
+
+- cephadm.shell:
+    host.a:
+      - ceph status
+
+# - cephadm.shell:
+#    host.a:
+#      - ceph_test_rgw_obj
+
+# - workunit:
+#    clients:
+#      client.0:
+#        - rgw/test_rgw_obj.sh
+
+    # client.0:
+    #   - |
+    #     cat > /tmp/s3cfg << 'EOF'
+    #     [default]
+    #     access_key = ceskey
+    #     secret_key = cessecret
+    #     host_base = host.b:8080
+    #     host_bucket = host.b:8080  
+    #     use_https = False
+    #     signature_v2 = True
+    #     EOF
+    #   - s3cmd -c /tmp/s3cfg mb s3://ces-baseline-bucket
+    #   - echo "CES S3 baseline data - must survive downgrade!" > /tmp/ces-s3-baseline.txt
+    #   - s3cmd -c /tmp/s3cfg put /tmp/ces-s3-baseline.txt s3://ces-baseline-bucket/ces-baseline-s3-object.txt
+    #   - s3cmd -c /tmp/s3cfg ls s3://ces-baseline-bucket/
+    #   - echo "CES S3 baseline data created successfully"

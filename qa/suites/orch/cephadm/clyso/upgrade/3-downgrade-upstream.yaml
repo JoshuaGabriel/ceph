@@ -1,0 +1,149 @@
+tasks:
+- cephadm.shell:
+    host.a:
+      - echo "PRE-DOWNGRADE CES VERSION:"
+      - ceph version
+      - ceph orch ps
+
+      - echo "Starting downgrade from CES to upstream CEPH v18.2.7..."
+      - ceph orch upgrade start --image quay.io/ceph/ceph:v18.2.7
+      - sleep 30
+
+      - |
+        cat > /tmp/upgrade_monitor.sh << 'EOF'
+        #!/bin/bash
+        
+        # Upgrade monitoring script for cephadm upgrade tests
+        # Monitors upgrade/downgrade completion by checking both upgrade status and daemon versions
+        
+        set -e
+        
+        TARGET_VERSION="$1"
+        OPERATION="$2"  # "upgrade" or "downgrade"
+        BASE_IMAGE_NAME="${3:-base}"
+        TARGET_IMAGE_NAME="${4:-target}"
+        TIMEOUT="${5:-2400}"
+        
+        if [ -z "$TARGET_VERSION" ] || [ -z "$OPERATION" ]; then
+            echo "Usage: $0 <target_version> <upgrade|downgrade> [base_image_name] [target_image_name] [timeout_seconds]"
+            exit 1
+        fi
+        
+        echo "=== CEPH Upgrade Monitor Started ==="
+        echo "Base image: $BASE_IMAGE_NAME"
+        echo "Target image: $TARGET_IMAGE_NAME"
+        echo "Operation: $OPERATION to $TARGET_VERSION"
+        echo "Timeout: ${TIMEOUT}s"
+        echo "Start time: $(date)"
+        
+        echo "=== Capturing Baseline Version ==="
+        ceph versions
+        baseline_version=$(ceph versions --format json | jq -r ".overall | keys[0]")
+        echo "Baseline version: $baseline_version"
+        
+        echo "=== Starting Upgrade Monitoring ==="
+        start_time=$(date +%s)
+        
+        while true; do
+            current_time=$(date +%s)
+            elapsed=$((current_time - start_time))
+            
+            echo ""
+            echo "=== Upgrade Status (Elapsed: ${elapsed}s) ==="
+            echo "Time: $(date)"
+            
+            echo "--- Orchestrator Upgrade Status ---"
+            upgrade_status=$(ceph orch upgrade status --format json)
+            echo "$upgrade_status"
+            
+            echo "--- Daemon Versions ---"
+            ceph versions
+            
+            in_progress=$(echo "$upgrade_status" | jq -r ".in_progress")
+            version_count=$(ceph versions --format json | jq ".overall | length")
+            
+            echo "Upgrade in progress: $in_progress"
+            echo "Number of different versions running: $version_count"
+            
+            if [ "$in_progress" = "false" ] && [ "$version_count" -eq 1 ]; then
+                current_version=$(ceph versions --format json | jq -r ".overall | keys[0]")
+                echo "All daemons now on: $current_version"
+                
+                if [ "$current_version" != "$baseline_version" ]; then
+                    echo ""
+                    echo "=== SUCCESS: Upgrade Completed ==="
+                    echo "From: $baseline_version"
+                    echo "To:   $current_version"
+                    echo "Base image: $BASE_IMAGE_NAME"
+                    echo "Target image: $TARGET_IMAGE_NAME"
+                    echo "Total time: ${elapsed}s"
+                    echo "End time: $(date)"
+                    break
+                else
+                    echo ""
+                    echo "=== SUCCESS: Already on Target Version ==="
+                    echo "Current version: $current_version"
+                    echo "Base image: $BASE_IMAGE_NAME"
+                    echo "Target image: $TARGET_IMAGE_NAME"
+                    echo "Total time: ${elapsed}s"
+                    echo "End time: $(date)"
+                    break
+                fi
+            else
+                echo "Upgrade still in progress or daemons on mixed versions"
+                if [ "$version_count" -gt 1 ]; then
+                    echo "--- Version Breakdown ---"
+                    ceph versions --format json | jq ".overall"
+                fi
+            fi
+            
+            if echo "$upgrade_status" | jq -r ".message" | grep -q -i "error\|fail"; then
+                echo ""
+                echo "=== ERROR: Upgrade Failed ==="
+                echo "Upgrade status shows error or failure"
+                echo "$upgrade_status"
+                exit 1
+            fi
+            
+            if [ $elapsed -ge $TIMEOUT ]; then
+                echo ""
+                echo "=== ERROR: Upgrade Timeout ==="
+                echo "Upgrade did not complete within $TIMEOUT seconds"
+                echo "Current status:"
+                echo "$upgrade_status"
+                ceph versions
+                exit 1
+            fi
+            
+            echo "Waiting 60 seconds before next check..."
+            sleep 60
+        done
+        
+        echo ""
+        echo "=== Final Verification ==="
+        ceph health detail
+        ceph orch ps
+        ceph status
+        
+        echo ""
+        echo "=== Upgrade Monitor Completed Successfully ==="
+        EOF
+        
+        chmod +x /tmp/upgrade_monitor.sh
+        /tmp/upgrade_monitor.sh "v18.2.7" "downgrade" "CES" "Upstream v18.2.7" "1800"
+
+      - echo "POST-DOWNGRADE UPSTREAM VERSION:"
+      - ceph version
+      - ceph orch ps
+      - ceph -s
+
+
+overrides:
+  ceph:
+    log-ignorelist:
+      - CEPHADM_STRAY_DAEMON  
+      - CEPHADM_FAILED_DAEMON
+      - CEPHADM_AGENT_DOWN
+      - CEPHADM_DAEMON_PLACE_FAIL
+    log-only-match:
+      - CEPHADM_
