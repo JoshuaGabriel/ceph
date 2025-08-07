@@ -35,11 +35,18 @@ def task(ctx, config):
         (remote,) = ctx.cluster.only(role).remotes.keys()
         log.info('Running python on role %s host %s', role, remote.name)
         log.info(code)
+        
+        # Handle both string and list input for code
+        if isinstance(code, list):
+            code_str = '\n'.join(code)
+        else:
+            code_str = code
+            
         args=[
             'TESTDIR={tdir}'.format(tdir=testdir),
             'python3',
         ]
         if sudo:
             args = ['sudo'] + args
-        remote.run(args=args, stdin=subst_vip(ctx, code))
+        remote.run(args=args, stdin=subst_vip(ctx, code_str))
 

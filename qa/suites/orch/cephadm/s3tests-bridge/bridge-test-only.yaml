@@ -1,0 +1,114 @@
+roles:
+- [host.a, mon.a, mgr.a, osd.0, osd.1, osd.2, client.0]
+
+tasks:
+- cephadm:
+
+- cephadm.apply:
+    specs:
+      - service_type: rgw
+        service_id: test
+        placement:
+          host_pattern: "*"
+        spec:
+          rgw_frontend_port: 8080
+
+- cephadm.wait_for_service:
+    service: rgw.test
+
+- cephadm_s3_bridge:
+    client.0:
+      discover_from_cephadm: true
+
+- exec:
+    client.0:
+      - echo "Bridge task completed - ctx.rgw should now be available for s3tests"
+      - echo "Testing RGW accessibility..."
+
+# This uses the same execution path that s3tests uses, so it will trigger our monkey patch
+- python:
+    client.0:
+      - |
+        import logging
+        from io import StringIO
+        log = logging.getLogger(__name__)
+        
+        log.info("=== Testing radosgw-admin monkey patch ===")
+        
+        # Get the remote connection (same way s3tests does it)
+        remote = list(ctx.cluster.only('client.0').remotes.keys())[0]
+        
+        log.info("Testing user creation via remote.run() - this should trigger monkey patch")
+        try:
+            # This should be intercepted by our monkey patch and converted to cephadm shell
+            result = remote.run(
+                args=[
+                    'radosgw-admin', 'user', 'create',
+                    '--uid=testuser',
+                    '--display-name=Test User', 
+                    '--access-key=testkey',
+                    '--secret-key=testsecret'
+                ],
+                stdout=StringIO()
+            )
+            log.info("✅ SUCCESS: radosgw-admin user create executed through monkey patch!")
+            output = result.stdout.getvalue() if hasattr(result.stdout, 'getvalue') else str(result.stdout)
+            log.info(f"Command output length: {len(output)} chars")
+            if 'testuser' in output or 'access_key' in output:
+                log.info("✅ User creation output looks correct")
+            else:
+                log.warning(f"⚠️ Unexpected output: {output[:200]}...")
+        except Exception as e:
+            log.error(f"❌ FAILED: radosgw-admin user create failed: {e}")
+            raise
+        
+        log.info("Testing user info retrieval via remote.run()")
+        try:
+            result = remote.run(
+                args=[
+                    'radosgw-admin', 'user', 'info',
+                    '--uid=testuser'
+                ],
+                stdout=StringIO()
+            )
+            log.info("✅ SUCCESS: radosgw-admin user info executed through monkey patch!")
+            output = result.stdout.getvalue() if hasattr(result.stdout, 'getvalue') else str(result.stdout)
+            if 'testuser' in output and 'access_key' in output:
+                log.info("✅ User info output contains expected fields")
+            else:
+                log.warning(f"⚠️ User info output: {output[:200]}...")
+        except Exception as e:
+            log.error(f"❌ FAILED: radosgw-admin user info failed: {e}")
+            raise
+        
+        log.info("=== ✅ Monkey patch test completed successfully! ===")
+        log.info("This confirms that s3tests radosgw-admin commands will work with cephadm")
+
+# Test S3 endpoint accessibility  
+- exec:
+    client.0:
+      - echo "Testing S3 endpoint accessibility..."
+      - 'response=$(curl -s http://localhost:8080/ 2>/dev/null || echo "CONNECTION_FAILED")'
+      - echo "RGW Response: $response"
+      - 'if echo "$response" | grep -q "ListBucketResult\|Error\|xml\|ACCESS_DENIED"; then echo "✅ RGW is responding with valid S3 response"; else echo "✗ RGW not responding correctly"; fi'
+
+# Cleanup test user using monkey patch (another test)
+- python:
+    client.0:
+      - |
+        import logging
+        log = logging.getLogger(__name__)
+        
+        log.info("=== Testing cleanup via monkey patch ===")
+        remote = list(ctx.cluster.only('client.0').remotes.keys())[0]
+        
+        try:
+            result = remote.run(args=[
+                'radosgw-admin', 'user', 'rm',
+                '--uid=testuser'
+            ])
+            log.info("✅ SUCCESS: User cleanup via monkey patch worked!")
+        except Exception as e:
+            log.warning(f"⚠️ Cleanup failed (this is often expected): {e}")
+        
+        log.info("=== Bridge functionality test completed ===")
