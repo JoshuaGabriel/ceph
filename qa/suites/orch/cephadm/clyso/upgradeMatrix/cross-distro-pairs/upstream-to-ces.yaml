@@ -1,0 +1,9 @@
+# Cross-distro test: Start with Upstream, upgrade to CES, downgrade back to Upstream  
+base_image: "quay.io/ceph/ceph:v18.2.7"
+target_image: "harbor.clyso.com/ces/ceph/ceph:ces-v25.03.2-rc.4"
+base_image_name: "Upstream-18.2.7"
+target_image_name: "CES-v25.03.2-rc.4"
+
+overrides:
+  ceph:
+    image: "quay.io/ceph/ceph:v18.2.7"
