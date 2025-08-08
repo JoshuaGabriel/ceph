@@ -318,7 +318,10 @@ def task(ctx, config):
     assert hasattr(ctx, 'ceph'), 'ctx.ceph not found - cephadm bridge requires ceph context'
     assert hasattr(ctx, 'cephadm'), 'ctx.cephadm not found - cephadm bridge requires cephadm context'
     assert hasattr(ctx, 'cluster'), 'ctx.cluster not found - cephadm bridge requires cluster context'
-    assert not hasattr(ctx, 'rgw'), 'ctx.rgw already exists - bridge should run before rgw task'
+    
+    # Allow ctx.rgw to exist from cephadm tasks, but ensure it doesn't have role_endpoints
+    if hasattr(ctx, 'rgw') and hasattr(ctx.rgw, 'role_endpoints'):
+        raise ConfigError('ctx.rgw.role_endpoints already exists - bridge should run before other rgw configuration tasks')
 
     try:
         discovered_endpoints = discover_cephadm_rgw_endpoints(ctx)
@@ -343,10 +346,11 @@ def task(ctx, config):
         log.error("Continuing anyway - ctx.rgw will still be created")
 
     # Create ctx.rgw structure for s3tests compatibility
-    class RGWContext:
-        pass
-
-    ctx.rgw = RGWContext()
+    if not hasattr(ctx, 'rgw'):
+        class RGWContext:
+            pass
+        ctx.rgw = RGWContext()
+    
     ctx.rgw.role_endpoints = role_endpoints
     ctx.rgw.cephadm_discovered_endpoints = discovered_endpoints
     ctx.rgw.cephadm_bridge_active = True
