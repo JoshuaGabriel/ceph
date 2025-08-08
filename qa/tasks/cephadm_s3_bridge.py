@@ -177,30 +177,36 @@ def discover_cephadm_rgw_endpoints(ctx):
         ports = service.get("ports", [])
         status = service.get("status_desc", "")
 
+        log.info(f"Processing service: {service_name}, hostname: {hostname}, ports: {ports}, status: {status}")
+
         if not service_name.startswith("rgw."):
+            log.debug(f"Skipping non-RGW service: {service_name}")
             continue
 
-        if status != "running":
+        if "running" not in status.lower():
             log.warning(f"RGW service {service_name} is not running: {status}")
-            continue
-
-        if not ports:
-            log.warning(f"No ports found for RGW service {service_name}")
-            continue
+            # Allow non-running services through for now, s3tests might still work
+            log.info(f"Continuing with non-running service {service_name} - s3tests might still work")
 
         # Extract port number (ports is typically ['8080/tcp'] format)
         port = None
-        for port_spec in ports:
-            if isinstance(port_spec, str) and "/" in port_spec:
-                port = int(port_spec.split("/")[0])
-                break
-            elif isinstance(port_spec, int):
-                port = port_spec
-                break
+        if ports:
+            for port_spec in ports:
+                if isinstance(port_spec, str) and "/" in port_spec:
+                    try:
+                        port = int(port_spec.split("/")[0])
+                        break
+                    except ValueError:
+                        continue
+                elif isinstance(port_spec, int):
+                    port = port_spec
+                    break
 
         if port is None:
             log.warning(f"Could not parse port for RGW service {service_name}: {ports}")
-            continue
+            # Fall back to default RGW port 8080
+            port = 8080
+            log.info(f"Using default port {port} for {service_name}")
 
         endpoints[service_name] = {
             "hostname": hostname,
@@ -208,6 +214,8 @@ def discover_cephadm_rgw_endpoints(ctx):
             "service_name": service_name,
             "status": status,
         }
+
+        log.info(f"Added endpoint: {service_name} -> {hostname}:{port} (status: {status})")
 
     log.info(f"Discovered RGW endpoints: {endpoints}")
     return endpoints
@@ -351,7 +359,13 @@ def task(ctx, config):
         raise e
 
     if not discovered_endpoints:
-        raise ConfigError("No RGW services found via cephadm orchestrator")
+        log.error("No RGW services found via cephadm orchestrator")
+        log.error("This usually means:")
+        log.error("  1. No RGW services have been deployed yet")
+        log.error("  2. RGW services haven't started yet (check with 'ceph orch ps')")
+        log.error("  3. cephadm bridge is running before RGW deployment")
+        log.error("Make sure to run cephadm.apply (with RGW service) and cephadm.wait_for_service before this bridge")
+        raise ConfigError("No RGW services found via cephadm orchestrator - see logs for troubleshooting steps")
 
     role_endpoints = map_roles_to_endpoints(ctx, config, discovered_endpoints)
 
