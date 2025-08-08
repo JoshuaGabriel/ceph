@@ -80,16 +80,12 @@ def patch_s3tests_radosgw_admin(ctx):
 
         return original_run(self, **kwargs)
 
-
     teuthology.orchestra.remote.Remote.run = cephadm_aware_run
 
 
 def restore_original_remote_run():
     """Restore original remote run method (for cleanup)"""
-    # TODO: In practice, this is tricky to implement cleanly since we don't
-    # store the original reference. The monkey patch will remain active
-    # for the duration of the test run, which is typically desired.
-    log.info("Note: Monkey patch cleanup not implemented - patch remains active")
+    log.info("not implemented - patch remains active")
 
 
 def discover_cephadm_rgw_endpoints(ctx):
@@ -314,14 +310,25 @@ def task(ctx, config):
     if config is None:
         config = {}
 
-    # Critical context assertions - fail fast if something is missing
-    assert hasattr(ctx, 'ceph'), 'ctx.ceph not found - cephadm bridge requires ceph context'
-    assert hasattr(ctx, 'cephadm'), 'ctx.cephadm not found - cephadm bridge requires cephadm context'
-    assert hasattr(ctx, 'cluster'), 'ctx.cluster not found - cephadm bridge requires cluster context'
-    
+    log.info("Starting cephadm s3tests bridge task")
+
+    assert hasattr(ctx, "ceph"), (
+        "ctx.ceph not found - cephadm bridge requires ceph context"
+    )
+    assert hasattr(ctx, "cephadm"), (
+        "ctx.cephadm not found - cephadm bridge requires cephadm context"
+    )
+    assert hasattr(ctx, "cluster"), (
+        "ctx.cluster not found - cephadm bridge requires cluster context"
+    )
+
+    log.info("Context assertions passed, checking for existing ctx.rgw...")
+
     # Allow ctx.rgw to exist from cephadm tasks, but ensure it doesn't have role_endpoints
-    if hasattr(ctx, 'rgw') and hasattr(ctx.rgw, 'role_endpoints'):
-        raise ConfigError('ctx.rgw.role_endpoints already exists - bridge should run before other rgw configuration tasks')
+    if hasattr(ctx, "rgw") and hasattr(ctx.rgw, "role_endpoints"):
+        raise ConfigError(
+            "ctx.rgw.role_endpoints already exists - bridge should run before other rgw configuration tasks"
+        )
 
     try:
         discovered_endpoints = discover_cephadm_rgw_endpoints(ctx)
@@ -336,7 +343,9 @@ def task(ctx, config):
 
     if not role_endpoints:
         log.error("No roles configured for RGW endpoint mapping")
-        log.error("Check your bridge task configuration - you need at least one role with 'discover_from_cephadm: true'")
+        log.error(
+            "Check your bridge task configuration - you need at least one role with 'discover_from_cephadm: true'"
+        )
         return
 
     try:
@@ -346,32 +355,35 @@ def task(ctx, config):
         log.error("Continuing anyway - ctx.rgw will still be created")
 
     # Create ctx.rgw structure for s3tests compatibility
-    if not hasattr(ctx, 'rgw'):
+    if not hasattr(ctx, "rgw"):
+
         class RGWContext:
             pass
+
         ctx.rgw = RGWContext()
-    
+
     ctx.rgw.role_endpoints = role_endpoints
     ctx.rgw.cephadm_discovered_endpoints = discovered_endpoints
     ctx.rgw.cephadm_bridge_active = True
 
-    # Setup radosgw-admin monkey patching
     try:
         patch_s3tests_radosgw_admin(ctx)
     except Exception as e:
         log.error(f"Monkey patch setup failed: {e}")
         raise e
 
-    # Final verification assertions
-    assert hasattr(ctx, 'rgw'), 'ctx.rgw was not created successfully'
-    assert hasattr(ctx.rgw, 'role_endpoints'), 'ctx.rgw.role_endpoints was not created'
-    assert hasattr(ctx.rgw, 'cephadm_bridge_active'), 'ctx.rgw.cephadm_bridge_active was not set'
-    assert ctx.rgw.cephadm_bridge_active, 'ctx.rgw.cephadm_bridge_active is not True'
-    assert len(ctx.rgw.role_endpoints) > 0, 'ctx.rgw.role_endpoints is empty'
+    assert hasattr(ctx, "rgw"), "ctx.rgw was not created successfully"
+    assert hasattr(ctx.rgw, "role_endpoints"), "ctx.rgw.role_endpoints was not created"
+    assert hasattr(ctx.rgw, "cephadm_bridge_active"), (
+        "ctx.rgw.cephadm_bridge_active was not set"
+    )
+    assert ctx.rgw.cephadm_bridge_active, "ctx.rgw.cephadm_bridge_active is not True"
+    assert len(ctx.rgw.role_endpoints) > 0, "ctx.rgw.role_endpoints is empty"
 
     try:
         yield
     finally:
-        # Verify ctx.rgw survived test execution
-        assert hasattr(ctx, 'rgw'), 'ctx.rgw was lost during test execution'
-        assert hasattr(ctx.rgw, 'cephadm_bridge_active'), 'ctx.rgw.cephadm_bridge_active was lost'
+        assert hasattr(ctx, "rgw"), "ctx.rgw was lost during test execution"
+        assert hasattr(ctx.rgw, "cephadm_bridge_active"), (
+            "ctx.rgw.cephadm_bridge_active was lost"
+        )
