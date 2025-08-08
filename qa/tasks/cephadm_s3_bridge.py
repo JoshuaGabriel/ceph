@@ -314,128 +314,60 @@ def task(ctx, config):
     if config is None:
         config = {}
 
-    log.info("🚀 STARTING cephadm s3tests bridge task")
-    log.info(f"🔍 DEBUG: Bridge task config: {config}")
-    
-    # Extensive context debugging
-    log.info("🔍 DEBUG: Checking available context attributes...")
-    log.info(f"🔍 DEBUG: hasattr(ctx, 'ceph') = {hasattr(ctx, 'ceph')}")
-    log.info(f"🔍 DEBUG: hasattr(ctx, 'cephadm') = {hasattr(ctx, 'cephadm')}")
-    log.info(f"🔍 DEBUG: hasattr(ctx, 'cluster') = {hasattr(ctx, 'cluster')}")
-    log.info(f"🔍 DEBUG: hasattr(ctx, 'rgw') = {hasattr(ctx, 'rgw')} (should be False initially)")
-    
-    if hasattr(ctx, 'ceph'):
-        log.info(f"🔍 DEBUG: ctx.ceph keys: {list(ctx.ceph.keys())}")
-        for cluster_name in ctx.ceph.keys():
-            log.info(f"🔍 DEBUG: ctx.ceph[{cluster_name}] attributes: {dir(ctx.ceph[cluster_name])}")
-            if hasattr(ctx.ceph[cluster_name], 'image'):
-                log.info(f"🔍 DEBUG: ctx.ceph[{cluster_name}].image = {ctx.ceph[cluster_name].image}")
-            if hasattr(ctx.ceph[cluster_name], 'fsid'):
-                log.info(f"🔍 DEBUG: ctx.ceph[{cluster_name}].fsid = {ctx.ceph[cluster_name].fsid}")
-    else:
-        log.error("❌ ERROR: ctx.ceph not found - this is critical!")
-    
-    if hasattr(ctx, 'cephadm'):
-        log.info(f"🔍 DEBUG: type(ctx.cephadm) = {type(ctx.cephadm)}")
-        log.info(f"🔍 DEBUG: ctx.cephadm = {ctx.cephadm}")
-    else:
-        log.error("❌ ERROR: ctx.cephadm not found")
+    # Critical context assertions - fail fast if something is missing
+    assert hasattr(ctx, 'ceph'), 'ctx.ceph not found - cephadm bridge requires ceph context'
+    assert hasattr(ctx, 'cephadm'), 'ctx.cephadm not found - cephadm bridge requires cephadm context'
+    assert hasattr(ctx, 'cluster'), 'ctx.cluster not found - cephadm bridge requires cluster context'
+    assert not hasattr(ctx, 'rgw'), 'ctx.rgw already exists - bridge should run before rgw task'
 
     try:
-        log.info("🔍 Phase 1: Attempting RGW endpoint discovery...")
         discovered_endpoints = discover_cephadm_rgw_endpoints(ctx)
-        log.info(f"✅ SUCCESS: Discovered {len(discovered_endpoints)} RGW endpoints")
     except Exception as e:
-        log.error(f"❌ CRITICAL: RGW endpoint discovery failed: {e}")
-        log.error(f"❌ Bridge task cannot continue - ctx.rgw will NOT be created!")
+        log.error(f"RGW endpoint discovery failed: {e}")
         raise e
 
     if not discovered_endpoints:
-        log.error("❌ CRITICAL: No RGW services found via cephadm orchestrator")
-        log.error("❌ Bridge task cannot continue - ctx.rgw will NOT be created!")
         raise ConfigError("No RGW services found via cephadm orchestrator")
 
-    log.info("🔍 Phase 2: Mapping roles to endpoints...")
     role_endpoints = map_roles_to_endpoints(ctx, config, discovered_endpoints)
 
     if not role_endpoints:
-        log.error("❌ CRITICAL: No roles configured for RGW endpoint mapping")
-        log.error("❌ Bridge task cannot continue - ctx.rgw will NOT be created!")
-        log.error("❌ Check your bridge task configuration - you need at least one role with 'discover_from_cephadm: true'")
+        log.error("No roles configured for RGW endpoint mapping")
+        log.error("Check your bridge task configuration - you need at least one role with 'discover_from_cephadm: true'")
         return
 
-    log.info(f"✅ SUCCESS: Mapped {len(role_endpoints)} roles to endpoints")
-    for role, endpoint in role_endpoints.items():
-        log.info(f"    🔗 {role} -> {endpoint.hostname}:{endpoint.port}")
-
-    log.info("🔍 Phase 3: Testing RGW endpoint accessibility...")
     try:
         wait_for_rgw_accessibility(ctx, role_endpoints)
-        log.info("✅ SUCCESS: All RGW endpoints are accessible")
     except Exception as e:
-        log.error(f"❌ ERROR: RGW accessibility test failed: {e}")
-        log.error("❌ Continuing anyway - ctx.rgw will still be created")
+        log.error(f"RGW accessibility test failed: {e}")
+        log.error("Continuing anyway - ctx.rgw will still be created")
 
-    log.info("🔍 Phase 4: Creating ctx.rgw structure for s3tests compatibility...")
-    
-    # Store original state for debugging
-    original_rgw_exists = hasattr(ctx, 'rgw')
-    log.info(f"🔍 DEBUG: Before creation - hasattr(ctx, 'rgw') = {original_rgw_exists}")
-
-    # Phase 4: Create ctx.rgw structure for s3tests compatibility
-    # Using simple class instead of dynamic type creation for better compatibility
+    # Create ctx.rgw structure for s3tests compatibility
     class RGWContext:
         pass
 
     ctx.rgw = RGWContext()
     ctx.rgw.role_endpoints = role_endpoints
-
-    log.info(f"🔍 DEBUG: After creation - hasattr(ctx, 'rgw') = {hasattr(ctx, 'rgw')}")
-    log.info(f"🔍 DEBUG: type(ctx.rgw) = {type(ctx.rgw)}")
-    log.info(f"🔍 DEBUG: hasattr(ctx.rgw, 'role_endpoints') = {hasattr(ctx.rgw, 'role_endpoints')}")
-    log.info(f"🔍 DEBUG: len(ctx.rgw.role_endpoints) = {len(ctx.rgw.role_endpoints)}")
-
-    log.info(f"✅ SUCCESS: Created ctx.rgw.role_endpoints with {len(role_endpoints)} endpoints")
-    for role, endpoint in role_endpoints.items():
-        log.info(f"  🔗 {role} -> {endpoint.hostname}:{endpoint.port}")
-
-    # Phase 5: Store discovery info and activate bridge
     ctx.rgw.cephadm_discovered_endpoints = discovered_endpoints
     ctx.rgw.cephadm_bridge_active = True
-    
-    log.info(f"🔍 DEBUG: Set ctx.rgw.cephadm_bridge_active = {ctx.rgw.cephadm_bridge_active}")
 
-    # Phase 6: Patch radosgw-admin commands for cephadm compatibility
-    log.info("🔍 Phase 5: Setting up radosgw-admin monkey patching...")
+    # Setup radosgw-admin monkey patching
     try:
         patch_s3tests_radosgw_admin(ctx)
-        log.info("✅ SUCCESS: Monkey patch for radosgw-admin commands activated")
     except Exception as e:
-        log.error(f"❌ ERROR: Monkey patch setup failed: {e}")
+        log.error(f"Monkey patch setup failed: {e}")
         raise e
 
-    # Final verification for s3tests compatibility
-    log.info("🔍 FINAL VERIFICATION: Checking s3tests compatibility...")
-    log.info(f"✅ hasattr(ctx, 'rgw') = {hasattr(ctx, 'rgw')}")
-    log.info(f"✅ type(ctx.rgw) = {type(ctx.rgw)}")
-    log.info(f"✅ hasattr(ctx.rgw, 'role_endpoints') = {hasattr(ctx.rgw, 'role_endpoints')}")
-    log.info(f"✅ ctx.rgw.cephadm_bridge_active = {getattr(ctx.rgw, 'cephadm_bridge_active', 'MISSING')}")
-    log.info(f"✅ len(ctx.rgw.role_endpoints) = {len(getattr(ctx.rgw, 'role_endpoints', {}))}")
-
-    log.info("🎉 SUCCESS: cephadm s3tests bridge task completed successfully!")
-    log.info("🎉 ctx.rgw is now ready for s3tests - the assertion should PASS!")
+    # Final verification assertions
+    assert hasattr(ctx, 'rgw'), 'ctx.rgw was not created successfully'
+    assert hasattr(ctx.rgw, 'role_endpoints'), 'ctx.rgw.role_endpoints was not created'
+    assert hasattr(ctx.rgw, 'cephadm_bridge_active'), 'ctx.rgw.cephadm_bridge_active was not set'
+    assert ctx.rgw.cephadm_bridge_active, 'ctx.rgw.cephadm_bridge_active is not True'
+    assert len(ctx.rgw.role_endpoints) > 0, 'ctx.rgw.role_endpoints is empty'
 
     try:
         yield
     finally:
-        # Cleanup logging with more detail
-        log.info("🔄 BRIDGE CLEANUP: Starting bridge task cleanup...")
-        log.info("🔄 Note: Monkey patch remains active for test duration (this is expected)")
-        log.info(f"🔄 Final state: hasattr(ctx, 'rgw') = {hasattr(ctx, 'rgw')}")
-        if hasattr(ctx, 'rgw'):
-            log.info(f"🔄 Final state: hasattr(ctx.rgw, 'cephadm_bridge_active') = {hasattr(ctx.rgw, 'cephadm_bridge_active')}")
-            log.info(f"🔄 Final state: len(ctx.rgw.role_endpoints) = {len(getattr(ctx.rgw, 'role_endpoints', {}))}")
-            log.info(f"🔄 Final state: ctx.rgw.cephadm_bridge_active = {getattr(ctx.rgw, 'cephadm_bridge_active', 'MISSING')}")
-        else:
-            log.error("🔄 ❌ CRITICAL: ctx.rgw was lost during test execution!")
-        log.info("🔄 Bridge task cleanup completed")
+        # Verify ctx.rgw survived test execution
+        assert hasattr(ctx, 'rgw'), 'ctx.rgw was lost during test execution'
+        assert hasattr(ctx.rgw, 'cephadm_bridge_active'), 'ctx.rgw.cephadm_bridge_active was lost'
