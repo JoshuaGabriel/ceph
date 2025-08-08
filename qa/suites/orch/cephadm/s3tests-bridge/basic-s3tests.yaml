@@ -30,9 +30,6 @@ tasks:
     client.0:
       discover_from_cephadm: true
 
-# note: tox is needed
-- tox: [client.0]
-
 - s3tests:
     client.0:
       rgw_server: client.0
