@@ -14,6 +14,7 @@ from teuthology.orchestra import run
 from teuthology import misc as teuthology
 from teuthology.exceptions import ConfigError
 import teuthology.orchestra.remote
+import contextlib
 
 import sys
 import os
@@ -318,6 +319,7 @@ def wait_for_rgw_accessibility(ctx, role_endpoints, timeout=60):
         log.info(f"RGW endpoint {role} is accessible")
 
 
+@contextlib.contextmanager
 def task(ctx, config):
     """
     Bridge task to make cephadm-deployed RGW compatible with s3tests.
