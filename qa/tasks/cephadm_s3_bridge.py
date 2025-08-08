@@ -329,6 +329,7 @@ def task(ctx, config):
           dns_name: rgw.example.com  # optional
           rgw_service: rgw.myservice  # optional, defaults to first found
     """
+    log.info(f"Config received: {config}")
     if config is None:
         config = {}
 
@@ -368,7 +369,7 @@ def task(ctx, config):
         raise ConfigError("No RGW services found via cephadm orchestrator - see logs for troubleshooting steps")
 
     role_endpoints = map_roles_to_endpoints(ctx, config, discovered_endpoints)
-
+    log.info(f"Available roles: {config.keys() if config else 'No config'}")
     if not role_endpoints:
         log.error("No roles configured for RGW endpoint mapping")
         log.error(
