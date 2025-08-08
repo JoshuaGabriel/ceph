@@ -38,45 +38,59 @@ def patch_s3tests_radosgw_admin(ctx):
     """
     Monkey patch teuthology remote execution to make radosgw-admin commands
     work inside cephadm containers when running s3tests.
+
+    Many teuthology tasks (eg. s3tests, rgw helpers) invoke radosgw-admin with
+    wrapper prefixes like ["adjust-ulimits", "ceph-coverage", <path>, ... ,
+    "radosgw-admin", ...]. The original patch only matched when args[0] was
+    "radosgw-admin" which missed these cases. Here we detect radosgw-admin at
+    any position, split the prefix, and wrap only the radosgw-admin portion
+    inside a 'sudo <cephadm> shell -c ... -k ... -- <radosgw-admin ...>' call.
     """
-    log.info("convert radosgw-admin to cephadm command")
+    log.info("Enabling cephadm-aware radosgw-admin monkey patch for s3tests")
 
     original_run = teuthology.orchestra.remote.Remote.run
 
     def cephadm_aware_run(self, **kwargs):
         args = kwargs.get("args", [])
 
-        if args and len(args) > 0 and args[0] == "radosgw-admin":
-            if detect_cephadm_deployment(ctx):
+        try:
+            # Locate the radosgw-admin binary within args (not just at index 0)
+            admin_idx = -1
+            for i, a in enumerate(args):
+                if isinstance(a, str) and a == "radosgw-admin":
+                    admin_idx = i
+                    break
+
+            if admin_idx != -1 and detect_cephadm_deployment(ctx):
                 log.info(f"Intercepting radosgw-admin command: {args}")
 
-                try:
-                    cluster_name = (
-                        list(ctx.ceph.keys())[0] if hasattr(ctx, "ceph") else "ceph"
-                    )
-                    image = ctx.ceph[cluster_name].image
+                cluster_name = list(ctx.ceph.keys())[0] if hasattr(ctx, "ceph") else "ceph"
+                image = ctx.ceph[cluster_name].image
+                fsid = ctx.ceph[cluster_name].fsid
+                cephadm_bin = getattr(ctx, "cephadm", "cephadm")
 
-                    cephadm_args = [
-                        "sudo",
-                        "cephadm",
-                        "--image",
-                        image,
-                        "shell",
-                        "-c",
-                        f"/etc/ceph/{cluster_name}.conf",
-                        "-k",
-                        f"/etc/ceph/{cluster_name}.client.admin.keyring",
-                        "--fsid",
-                        ctx.ceph[cluster_name].fsid,
-                        "--",
-                    ] + args
+                # Everything before radosgw-admin should remain as-is
+                prefix = list(args[:admin_idx])
+                admin_and_rest = list(args[admin_idx:])
 
-                    log.info(f"Converted to cephadm shell command: {cephadm_args}")
-                    kwargs["args"] = cephadm_args
+                cephadm_prefix = [
+                    "sudo",
+                    cephadm_bin,
+                    "--image", image,
+                    "shell",
+                    "-c", f"/etc/ceph/{cluster_name}.conf",
+                    "-k", f"/etc/ceph/{cluster_name}.client.admin.keyring",
+                    "--fsid", fsid,
+                    "--",
+                ]
 
-                except Exception as e:
-                    log.error(f"Failed to convert radosgw-admin to cephadm shell: {e}")
-                    pass
+                new_args = prefix + cephadm_prefix + admin_and_rest
+                log.info(f"Converted to cephadm shell command: {new_args}")
+                kwargs["args"] = new_args
+
+        except Exception as e:
+            # On any failure, fall back to original behavior
+            log.error(f"cephadm radosgw-admin monkey patch error: {e}")
 
         return original_run(self, **kwargs)
 
