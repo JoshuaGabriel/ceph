@@ -19,6 +19,11 @@ tasks:
 - cephadm_s3_bridge:
     client.0:
       discover_from_cephadm: true
+- cephadm.shell:
+    host.a:
+      - ceph osd pool ls detail
+      - ceph orch ls
+      - ceph orch ps
 - rgw:
     client.0:
  
