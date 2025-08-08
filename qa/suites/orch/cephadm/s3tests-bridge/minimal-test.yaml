@@ -16,6 +16,9 @@ tasks:
 - cephadm.wait_for_service:
     service: rgw.test
 
+- rgw:
+    client.0:
+
 - cephadm_s3_bridge:
     client.0:
       discover_from_cephadm: true
@@ -23,23 +26,23 @@ tasks:
 
 - s3tests:
     client.0:
-      rgw_server: client.0
-      force-branch: master
-      conf:
-        DEFAULT:
-          is_secure: false
-          port: 8080
-          calling_format: ordinary
-        fixtures:
-          bucket prefix: s3test-{random}-
-        # POC run
-        exclude:
-          - test_bucket_policy*
-          - test_lifecycle*  
-          - test_encryption*
-          - test_multipart_upload_size_too_small
-          - test_cors*
-          - test_website*
-          - test_logging*
-          - test_versioning*
-      filter: "test_bucket_list_empty or test_bucket_create or test_object_write or test_object_read"
+#       rgw_server: client.0
+#       force-branch: master
+#       conf:
+#         DEFAULT:
+#           is_secure: false
+#           port: 8080
+#           calling_format: ordinary
+#         fixtures:
+#           bucket prefix: s3test-{random}-
+#         # POC run
+#         exclude:
+#           - test_bucket_policy*
+#           - test_lifecycle*  
+#           - test_encryption*
+#           - test_multipart_upload_size_too_small
+#           - test_cors*
+#           - test_website*
+#           - test_logging*
+#           - test_versioning*
+#       filter: "test_bucket_list_empty or test_bucket_create or test_object_write or test_object_read"

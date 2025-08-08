@@ -36,7 +36,7 @@ def detect_cephadm_deployment(ctx):
 
 def patch_s3tests_radosgw_admin(ctx):
     """
-    Monkey patch teuthology remote execution to make radosgw-admin commands
+    patch teuthology remote execution to make radosgw-admin commands
     work inside cephadm containers when running s3tests.
 
     Many teuthology tasks (eg. s3tests, rgw helpers) invoke radosgw-admin with

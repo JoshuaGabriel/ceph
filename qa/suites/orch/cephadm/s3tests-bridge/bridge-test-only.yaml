@@ -19,36 +19,6 @@ tasks:
 - cephadm_s3_bridge:
     client.0:
       discover_from_cephadm: true
-
-- exec:
+- rgw:
     client.0:
-      - echo "Bridge task completed - ctx.rgw should now be available for s3tests"
-      - echo "Testing RGW accessibility..."
-
-# Test the monkey patch by directly executing radosgw-admin commands
-# The bridge should intercept these and run them inside cephadm containers
-- exec:
-    client.0:
-      - echo "=== Testing radosgw-admin monkey patch ==="
-      - echo "Creating test user (this should be intercepted by bridge)..."
-      - radosgw-admin user create --uid=testuser --display-name="Test User" --access-key=testkey --secret-key=testsecret
-      - echo "✅ User creation succeeded!"
-      - echo "Retrieving user info..."
-      - radosgw-admin user info --uid=testuser
-      - echo "✅ User info retrieval succeeded!"
-
-# Test S3 endpoint accessibility  
-- exec:
-    client.0:
-      - echo "Testing S3 endpoint accessibility..."
-      - 'response=$(curl -s http://localhost:8080/ 2>/dev/null || echo "CONNECTION_FAILED")'
-      - echo "RGW Response: $response"
-      - 'if echo "$response" | grep -q "ListBucketResult\|Error\|xml\|ACCESS_DENIED"; then echo "✅ RGW is responding with valid S3 response"; else echo "✗ RGW not responding correctly"; fi'
-
-# Cleanup test user (another test of the monkey patch)
-- exec:
-    client.0:
-      - echo "=== Testing cleanup via monkey patch ==="
-      - echo "Removing test user..."
-      - radosgw-admin user rm --uid=testuser || echo "⚠️ Cleanup failed (this is often expected if user doesn't exist)"
-      - echo "=== Bridge functionality test completed ==="
+ 

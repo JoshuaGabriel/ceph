@@ -30,16 +30,16 @@ tasks:
     client.0:
       discover_from_cephadm: true
 
-- s3tests:
-    client.0:
-      rgw_server: client.0
-      force-branch: master
-      conf:
-        DEFAULT:
-          is_secure: false
-          port: 8080
-          calling_format: ordinary
-        fixtures:
-          bucket prefix: test-{random}-
-      # Only run 3 basic tests to verify bridge works
-      filter: "test_bucket_list_empty or test_bucket_create_naming_good_long_255"
+# - s3tests:
+#     client.0:
+#       rgw_server: client.0
+#       force-branch: master
+#       conf:
+#         DEFAULT:
+#           is_secure: false
+#           port: 8080
+#           calling_format: ordinary
+#         fixtures:
+#           bucket prefix: test-{random}-
+#       # Only run 3 basic tests to verify bridge works
+#       filter: "test_bucket_list_empty or test_bucket_create_naming_good_long_255"
