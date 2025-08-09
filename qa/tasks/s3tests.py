@@ -133,9 +133,6 @@ def create_users(ctx, config, s3tests_conf):
             # create user
             ctx.cluster.only(client).run(
                 args=[
-                    'adjust-ulimits',
-                    'ceph-coverage',
-                    '{tdir}/archive/coverage'.format(tdir=testdir),
                     'radosgw-admin',
                     '-n', client_with_id,
                     'user', 'create',
@@ -152,9 +149,6 @@ def create_users(ctx, config, s3tests_conf):
             if not ctx.dbstore_variable:
                 ctx.cluster.only(client).run(
                     args=[
-                        'adjust-ulimits',
-                        'ceph-coverage',
-                        '{tdir}/archive/coverage'.format(tdir=testdir),
                         'radosgw-admin',
                         '-n', client_with_id,
                         'mfa', 'create',
@@ -172,9 +166,6 @@ def create_users(ctx, config, s3tests_conf):
             if section=='iam':
                 ctx.cluster.only(client).run(
                     args=[
-                        'adjust-ulimits',
-                        'ceph-coverage',
-                        '{tdir}/archive/coverage'.format(tdir=testdir),
                         'radosgw-admin',
                         '-n', client_with_id,
                         'caps', 'add',
@@ -185,9 +176,6 @@ def create_users(ctx, config, s3tests_conf):
                 )
                 ctx.cluster.only(client).run(
                     args=[
-                        'adjust-ulimits',
-                        'ceph-coverage',
-                        '{tdir}/archive/coverage'.format(tdir=testdir),
                         'radosgw-admin',
                         '-n', client_with_id,
                         'caps', 'add',
@@ -220,9 +208,6 @@ def create_users(ctx, config, s3tests_conf):
                 client_with_id = daemon_type + '.' + client_id
                 ctx.cluster.only(client).run(
                     args=[
-                        'adjust-ulimits',
-                        'ceph-coverage',
-                        '{tdir}/archive/coverage'.format(tdir=testdir),
                         'radosgw-admin',
                         '-n', client_with_id,
                         'user', 'rm',

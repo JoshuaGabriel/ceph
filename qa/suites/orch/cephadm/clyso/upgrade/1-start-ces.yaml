@@ -1,0 +1,45 @@
+roles:
+- - host.a
+  - mon.a
+  - mgr.a  
+  - osd.0
+- - host.b
+  - osd.1
+  - mgr.b
+  - client.0
+- - host.b
+  - osd.2
+  - mgr.c
+
+tasks:
+# Install system packages via pexec (avoids CEPH RPM installation)
+- pexec:
+    all:
+    - sudo dnf install s3cmd curl jq -y
+
+- cephadm:
+
+- cephadm.shell:
+    host.a:
+      - ceph status
+      - ceph orch ps
+      - ceph version
+      - echo "Starting with CES version (from override YAML)"
+
+openstack:
+- volumes:
+    count: 4
+    size: 20
+
+overrides:
+  ceph:
+    conf:
+      osd:
+        osd shutdown pgref assert: true
+    log-only-match:
+      - CEPHADM_
+    log-ignorelist:
+      - CEPHADM_DAEMON_PLACE_FAIL
+      - CEPHADM_FAILED_DAEMON
+      - CEPHADM_STRAY_DAEMON
+      - CEPHADM_AGENT_DOWN

@@ -1,0 +1,46 @@
+roles:
+- [host.a, mon.a, mgr.a, osd.0, osd.1, osd.2, client.0]
+
+overrides:
+  ceph:
+    log-to-file: true
+    conf:
+      global:
+        log to file: true
+        mon cluster log to file: true
+      mon:
+        mon_warn_on_insecure_global_id_reclaim_allowed: false
+
+tasks:
+- cephadm:
+
+- cephadm.apply:
+    specs:
+      - service_type: rgw
+        service_id: s3test
+        placement:
+          host_pattern: "*"
+        spec:
+          rgw_frontend_port: 8080
+
+- cephadm.wait_for_service:
+    service: rgw.s3test
+
+- cephadm_s3_bridge:
+    client.0:
+      discover_from_cephadm: true
+
+- tox: [client.0]
+- s3tests:
+    client.0:
+      rgw_server: client.0
+      force-branch: master
+      conf:
+        DEFAULT:
+          is_secure: false
+          port: 8080
+          calling_format: ordinary
+        fixtures:
+          bucket prefix: test-{random}-
+      # Only run 3 basic tests to verify bridge works
+      filter: "test_bucket_list_empty or test_bucket_create_naming_good_long_255"
