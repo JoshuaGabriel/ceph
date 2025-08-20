@@ -7,7 +7,7 @@ tasks:
       - ceph -s
 
       - echo "Starting downgrade from reef-18.2.7 back to CES-v25.03.2-rc.4..."
-      - ceph orch upgrade start --image "harbor.clyso.com/ces/ceph/ceph:ces-v25.03.2-rc.4"
+      - ceph orch upgrade start --image "{{ ctx.config.base_image }}"
       - sleep 30
 
       - |

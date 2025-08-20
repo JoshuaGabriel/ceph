@@ -7,7 +7,7 @@ tasks:
       - ceph -s
 
       - echo "Starting upgrade from CES-v25.03.2-rc.4 to reef-18.2.7..."
-      - ceph orch upgrade start --image "quay.io/ceph/ceph:v18.2.7"
+      - ceph orch upgrade start --image "{{ ctx.config.target_image }}"
       - sleep 30
 
       - |
