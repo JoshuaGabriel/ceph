@@ -1,0 +1,17 @@
+roles:
+- - host.a
+  - mon.a
+  - mgr.a  
+  - osd.0
+- - host.b
+  - osd.1
+  - mgr.b
+  - client.0
+- - host.c
+  - osd.2
+  - mgr.c
+
+openstack:
+- volumes:
+    count: 4
+    size: 20

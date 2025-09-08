@@ -4,9 +4,10 @@ tasks:
     no_coverage_and_limits: true #set this to true to avoid adjust-ulimits script since it isn't installed when only images are used
     clients:
         client.0:
-            - upgrade.sh
+            - test_upgrade_downgrade.sh
     env:
         BASE_IMAGE: "{{ctx.config.target_image}}"
         TARGET_IMAGE: "{{ctx.config.base_image}}"
         BASE_IMAGE_NAME: "{{ctx.config.target_image_name}}"
         TARGET_IMAGE_NAME: "{{ctx.config.base_image_name}}"
+        TARGET_VERSION: "{{ctx.config.target_version}}"

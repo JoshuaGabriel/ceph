@@ -1,16 +1,3 @@
-roles:
-- - host.a
-  - mon.a
-  - mgr.a  
-  - osd.0
-- - host.b
-  - osd.1
-  - mgr.b
-  - client.0
-- - host.b
-  - osd.2
-  - mgr.c
-
 tasks:
 # Install system packages via pexec (avoids CEPH RPM installation)
 - pexec:
@@ -24,12 +11,7 @@ tasks:
       - ceph status
       - ceph orch ps
       - ceph version
-      - echo "Starting with CES version (from override YAML)"
-
-openstack:
-- volumes:
-    count: 4
-    size: 20
+      - echo "Starting with {{ctx.config.base_image_name}}"
 
 overrides:
   ceph:

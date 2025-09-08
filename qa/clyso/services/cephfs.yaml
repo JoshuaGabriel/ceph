@@ -1,5 +1,4 @@
 tasks:
-- print: "=== DEPLOYING CEPHFS SERVICE ==="
 
 # Use cephadm.shell to execute commands via cephadm
 - cephadm.shell:
