@@ -80,6 +80,8 @@ For example:
 .. note:: A ``default`` zone is created for you if you have not done any
    previous :ref:`Multisite Configuration <multisite>`.
 
+.. note:: The RGW daemon needs to be restarted for compression to take place and
+   objects uploaded prior to enabling compression would need to be reuploaded.
 
 Statistics
 ==========
