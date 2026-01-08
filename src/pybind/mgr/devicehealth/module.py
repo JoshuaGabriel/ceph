@@ -17,12 +17,23 @@ TIME_FORMAT = '%Y%m%d-%H%M%S'
 DEVICE_HEALTH = 'DEVICE_HEALTH'
 DEVICE_HEALTH_IN_USE = 'DEVICE_HEALTH_IN_USE'
 DEVICE_HEALTH_TOOMANY = 'DEVICE_HEALTH_TOOMANY'
+BLUESTORE_ESB_UNSAFE = 'BLUESTORE_ESB_UNSAFE'
 HEALTH_MESSAGES = {
     DEVICE_HEALTH: '%d device(s) expected to fail soon',
     DEVICE_HEALTH_IN_USE: '%d daemon(s) expected to fail soon and still contain data',
     DEVICE_HEALTH_TOOMANY: 'Too many daemons are expected to fail soon',
+    BLUESTORE_ESB_UNSAFE: '%d OSD(s) should be drained and redeployed due to elastic shared blob bug',
 }
 
+# tracker.ceph.com/issues/70390
+ESB_BUGGY_VERSIONS = {
+    (19, 2, 0),
+    (19, 2, 1),
+    (19, 2, 2),
+    (19, 2, 3),
+}
+
+HealthChecksT = Dict[str, Dict[str, Union[int, str, Sequence[str]]]]
 
 def get_ata_wear_level(data: Dict[Any, Any]) -> Optional[float]:
     """
@@ -45,6 +56,21 @@ def get_nvme_wear_level(data: Dict[Any, Any]) -> Optional[float]:
     if pct_used is None:
         return None
     return pct_used / 100.0
+
+
+def parse_ceph_version(version_str: str) -> Optional[Tuple[int, int, int]]:
+    """
+    Parse a ceph version string into (major, minor, patch) tuple.
+    Handles formats like "ceph version 19.2.0 (abc123)" or "19.2.0-123-gabc123"
+    Returns None if parsing fails.
+    """
+    if not version_str:
+        return None
+    # Try to extract version numbers from various formats
+    match = re.search(r'(\d+)\.(\d+)\.(\d+)', version_str)
+    if match:
+        return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    return None
 
 
 class Module(MgrModule):
@@ -600,13 +626,67 @@ class Module(MgrModule):
         res = self._get_device_metrics(devid, sample=sample)
         return 0, json.dumps(res, indent=4, sort_keys=True), ''
 
+    def check_esb_unsafe_osds(self) -> HealthChecksT:
+        """
+        Check for OSDs created with elastic shared blobs (ESB) enabled on
+        Ceph versions with known bugs (19.2.0-19.2.3). These OSDs have
+        corrupted shard boundaries and should be drained and redeployed.
+        See https://tracker.ceph.com/issues/70390
+        """
+        checks: HealthChecksT = {}
+        osd_metadata = self.get('osd_metadata')
+        if not osd_metadata:
+            return checks
+
+        affected_by_host: Dict[str, List[str]] = {}
+
+        for osd_id_str, metadata in osd_metadata.items():
+            esb_enabled = metadata.get('bluestore_elastic_shared_blobs', '0')
+            if esb_enabled != '1':
+                continue
+
+            version_when_created = metadata.get('ceph_version_when_created', '')
+            if not version_when_created:
+                continue
+
+            version_tuple = parse_ceph_version(version_when_created)
+            if version_tuple is None:
+                continue
+
+            if version_tuple not in ESB_BUGGY_VERSIONS:
+                continue
+
+            hostname = metadata.get('hostname', 'unknown')
+            if hostname not in affected_by_host:
+                affected_by_host[hostname] = []
+            affected_by_host[hostname].append(f'osd.{osd_id_str}')
+
+        if affected_by_host:
+            detail_messages: List[str] = []
+            total_osds = 0
+            for hostname, osds in sorted(affected_by_host.items()):
+                total_osds += len(osds)
+                osd_list = ', '.join(sorted(osds, key=lambda x: int(x.split('.')[1])))
+                detail_messages.append(f'{hostname}: {osd_list}')
+
+            detail_messages.append('See https://tracker.ceph.com/issues/70390')
+
+            checks[BLUESTORE_ESB_UNSAFE] = {
+                'severity': 'warning',
+                'summary': HEALTH_MESSAGES[BLUESTORE_ESB_UNSAFE] % total_osds,
+                'count': total_osds,
+                'detail': detail_messages,
+            }
+
+        return checks
+
     def check_health(self) -> Tuple[int, str, str]:
         self.log.info('Check health')
         config = self.get('config')
         min_in_ratio = float(config.get('mon_osd_min_in_ratio'))
         mark_out_threshold_td = timedelta(seconds=self.mark_out_threshold)
         warn_threshold_td = timedelta(seconds=self.warn_threshold)
-        checks: Dict[str, Dict[str, Union[int, str, Sequence[str]]]] = {}
+        checks: HealthChecksT = {}
         health_warnings: Dict[str, List[str]] = {
             DEVICE_HEALTH: [],
             DEVICE_HEALTH_IN_USE: [],
@@ -706,6 +786,8 @@ class Module(MgrModule):
                     'count': len(ls),
                     'detail': ls,
                 }
+        esb_checks = self.check_esb_unsafe_osds()
+        checks.update(esb_checks)
         self.set_health_checks(checks)
         return 0, "", ""
 

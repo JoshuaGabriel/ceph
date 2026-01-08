@@ -1060,6 +1060,34 @@ Alternatively, you can silence this health check by adjusting options including
 warned, however, that this will increase the likelihood of unrecoverable data
 loss.
 
+BLUESTORE_ESB_UNSAFE
+____________________
+
+One or more OSDs were created with elastic shared blobs (ESB) enabled on Ceph
+versions 19.2.0 through 19.2.3, which have a bug that causes shared blob
+references to span across shard boundaries. This can result in data corruption
+and OSD crashes, and cannot be fixed by upgrading alone.
+
+The health check detail lists affected OSDs grouped by host. For example::
+
+    HEALTH_WARN 3 OSD(s) should be drained and redeployed due to elastic shared blob bug
+        host1: osd.0, osd.1
+        host2: osd.5
+        See https://tracker.ceph.com/issues/70390
+
+To resolve this issue, each affected OSD must be drained and redeployed with the 
+config setting off or deployed in a newer version with the fix.
+
+This warning will persist until all affected OSDs have been redeployed. To
+temporarily silence this warning, run:
+
+.. prompt:: bash $
+
+   ceph health mute BLUESTORE_ESB_UNSAFE
+
+For more details about this issue, see `Ceph Tracker #70390
+<https://tracker.ceph.com/issues/70390>`_.
+
 
 Data health (pools & placement groups)
 --------------------------------------
