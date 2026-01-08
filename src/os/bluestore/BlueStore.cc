@@ -12081,6 +12081,7 @@ void BlueStore::collect_metadata(map<string,string> *pm)
   (*pm)["bluestore_allocator"] = alloc ? alloc->get_type() : "null";
   (*pm)["bluestore_write_mode"] = use_write_v2 ? "new" : "classic";
   (*pm)["bluestore_onode_segmentation"] = segment_size == 0 ? "inactive" : "active";
+  (*pm)["bluestore_elastic_shared_blobs"] = stringify((int)elastic_shared_blobs);
 }
 
 int BlueStore::get_numa_node(
