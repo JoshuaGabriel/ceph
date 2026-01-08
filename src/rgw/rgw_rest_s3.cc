@@ -4817,6 +4817,8 @@ void RGWListMultipart_ObjStore_S3::send_response()
 
     if (cksum && cksum->aws()) {
       s->formatter->dump_string("ChecksumAlgorithm", cksum->uc_type_string());
+      auto cksum_type = rgw::cksum::get_checksum_type(*cksum, true /* is_multipart */);
+      s->formatter->dump_string("ChecksumType", std::get<1>(cksum_type));
     }
 
     for (; iter != upload->get_parts().end(); ++iter) {

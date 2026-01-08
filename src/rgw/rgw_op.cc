@@ -7614,17 +7614,8 @@ void RGWListMultipart::execute(optional_yield y)
   if (op_ret < 0)
     return;
 
-  iter = attrs.find(RGW_ATTR_CKSUM);
-  if (iter != attrs.end()) {
-    auto bliter = iter->second.cbegin();
-    try {
-      rgw::cksum::Cksum tcksum;
-      tcksum.decode(bliter);
-      cksum = std::move(tcksum);
-    } catch (buffer::error& err) {
-      ldpp_dout(this, 0) << "ERROR: could not decode stored cksum, caught buffer::error" << dendl;
-      op_ret = -EIO;
-    }
+  if (upload->cksum_type != rgw::cksum::Type::none) {
+    cksum = rgw::cksum::Cksum(upload->cksum_type);
   }
   if (op_ret < 0)
     return;
