@@ -1026,6 +1026,10 @@ COMMAND("osd rm-pg-upmap-items "
 	"name=pgid,type=CephPgid",
 	"clear pg_upmap_items mapping for <pgid> (developers only)",
         "osd", "rw")
+COMMAND("osd pg-upmap-items-bulk "
+	"name=mappings,type=CephString",
+	"set or clear multiple pg_upmap_items under one epoch (developers only)",
+        "osd", "rw")
 COMMAND("osd pg-upmap-primary "
 	"name=pgid,type=CephPgid "
 	"name=id,type=CephOsdName ",
