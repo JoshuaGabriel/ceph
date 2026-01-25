@@ -3754,6 +3754,62 @@ TEST_F(OSDMapTest, pgtemp_primaryfirst_comprehensive) {
   }
 }
 
+TEST_F(OSDMapTest, BulkPGUpmapItems)
+{
+  set_up_map(12);
+
+  pg_t pgid1 = osdmap.raw_pg_to_pg(pg_t(0, my_rep_pool));
+  pg_t pgid2 = osdmap.raw_pg_to_pg(pg_t(1, my_rep_pool));
+  pg_t pgid3 = osdmap.raw_pg_to_pg(pg_t(2, my_rep_pool));
+
+  vector<int> up1, up2, up3;
+  int up_primary;
+  osdmap.pg_to_raw_up(pgid1, &up1, &up_primary);
+  osdmap.pg_to_raw_up(pgid2, &up2, &up_primary);
+  osdmap.pg_to_raw_up(pgid3, &up3, &up_primary);
+
+  auto find_target = [this](const vector<int>& up) {
+    for (int i = 0; i < (int)get_num_osds(); i++)
+      if (std::find(up.begin(), up.end(), i) == up.end())
+        return i;
+    return -1;
+  };
+
+  epoch_t epoch_before_set = osdmap.get_epoch();
+  {
+    OSDMap::Incremental inc(osdmap.get_epoch() + 1);
+    for (auto& [pgid, up] :
+         {make_pair(pgid1, up1), make_pair(pgid2, up2), make_pair(pgid3, up3)}) {
+      vector<pair<int32_t, int32_t>> items{{up[0], find_target(up)}};
+      inc.new_pg_upmap_items[pgid] =
+          mempool::osdmap::vector<pair<int32_t, int32_t>>(
+              items.begin(), items.end());
+    }
+    osdmap.apply_incremental(inc);
+  }
+  // make sure changes are done in one epoch
+  ASSERT_EQ(osdmap.get_epoch(), epoch_before_set + 1);
+  ASSERT_TRUE(osdmap.have_pg_upmaps(pgid1));
+  ASSERT_TRUE(osdmap.have_pg_upmaps(pgid2));
+  ASSERT_TRUE(osdmap.have_pg_upmaps(pgid3));
+
+  // rm pgid1, add upmap to pgid3, no change to pgid 2
+  epoch_t epoch_before_mixed = osdmap.get_epoch();
+  {
+    OSDMap::Incremental inc(osdmap.get_epoch() + 1);
+    inc.old_pg_upmap_items.insert(pgid1);
+    vector<pair<int32_t, int32_t>> items{{up3[1], find_target(up3)}};
+    inc.new_pg_upmap_items[pgid3] =
+        mempool::osdmap::vector<pair<int32_t, int32_t>>(
+            items.begin(), items.end());
+    osdmap.apply_incremental(inc);
+  }
+  ASSERT_EQ(osdmap.get_epoch(), epoch_before_mixed + 1); // single epoch
+  ASSERT_FALSE(osdmap.have_pg_upmaps(pgid1));
+  ASSERT_TRUE(osdmap.have_pg_upmaps(pgid2));
+  ASSERT_TRUE(osdmap.have_pg_upmaps(pgid3));
+}
+
 INSTANTIATE_TEST_SUITE_P(
   OSDMap,
   OSDMapTest,
