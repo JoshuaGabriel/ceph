@@ -10542,71 +10542,50 @@ struct BulkUpmapResult {
   vector<std::tuple<pg_t,string,string>> failed;
 };
 
-static int parse_bulk_upmap_items(
-    CephContext* cct,
-    const cmdmap_t& cmdmap,
-    const OSDMap& osdmap,
+static int
+parse_bulk_upmap_items_json(
+    const string& json_str,
     vector<BulkUpmapEntry>* entries,
-    stringstream& parse_errors)
+    stringstream& ss)
 {
-  string mappings_str;
-  if (!cmd_getval(cmdmap, "mappings", mappings_str)) {
-    parse_errors << "missing 'mappings' parameter";
+  json_spirit::mValue root;
+  if (!json_spirit::read(json_str, root) ||
+      root.type() != json_spirit::obj_type) {
+    ss << "invalid JSON object";
     return -EINVAL;
   }
 
-  // Allow single quotes for shell friendliness
-  std::replace(begin(mappings_str), end(mappings_str), '\'', '"');
-
-  json_spirit::mValue json_root;
-  if (!json_spirit::read(mappings_str, json_root)) {
-    parse_errors << "invalid JSON";
-    return -EINVAL;
-  }
-
-  if (json_root.type() != json_spirit::obj_type) {
-    parse_errors << "JSON root must be an object";
-    return -EINVAL;
-  }
-
-  const auto& root_obj = json_root.get_obj();
-  auto mappings_it = root_obj.find("mappings");
-  if (mappings_it == root_obj.end() ||
+  auto mappings_it = root.get_obj().find("mappings");
+  if (mappings_it == root.get_obj().end() ||
       mappings_it->second.type() != json_spirit::array_type) {
-    parse_errors << "missing or invalid 'mappings' array";
+    ss << "missing 'mappings' array";
     return -EINVAL;
   }
 
-  const auto& mappings_arr = mappings_it->second.get_array();
-  for (size_t i = 0; i < mappings_arr.size(); i++) {
-    if (mappings_arr[i].type() != json_spirit::obj_type) {
-      parse_errors << "mapping[" << i << "] must be an object";
+  for (const auto& m : mappings_it->second.get_array()) {
+    if (m.type() != json_spirit::obj_type) {
+      ss << "mapping entry must be an object";
       return -EINVAL;
     }
-    const auto& entry_obj = mappings_arr[i].get_obj();
+    const auto& obj = m.get_obj();
 
-    // Parse pgid
-    auto pgid_it = entry_obj.find("pgid");
-    if (pgid_it == entry_obj.end() ||
-        pgid_it->second.type() != json_spirit::str_type) {
-      parse_errors << "mapping[" << i << "] missing or invalid 'pgid'";
+    auto it = obj.find("pgid");
+    if (it == obj.end() || it->second.type() != json_spirit::str_type) {
+      ss << "missing 'pgid'";
       return -EINVAL;
     }
     pg_t pgid;
-    if (!pgid.parse(pgid_it->second.get_str().c_str())) {
-      parse_errors << "mapping[" << i << "] invalid pgid format '"
-                   << pgid_it->second.get_str() << "'";
+    if (!pgid.parse(it->second.get_str().c_str())) {
+      ss << "invalid pgid: " << it->second.get_str();
       return -EINVAL;
     }
 
-    // Parse action
-    auto action_it = entry_obj.find("action");
-    if (action_it == entry_obj.end() ||
-        action_it->second.type() != json_spirit::str_type) {
-      parse_errors << "mapping[" << i << "] missing or invalid 'action'";
+    it = obj.find("action");
+    if (it == obj.end() || it->second.type() != json_spirit::str_type) {
+      ss << "missing 'action'";
       return -EINVAL;
     }
-    const string& action = action_it->second.get_str();
+    const string& action = it->second.get_str();
 
     BulkUpmapEntry entry;
     entry.pgid = pgid;
@@ -10615,38 +10594,30 @@ static int parse_bulk_upmap_items(
       entry.is_removal = true;
     } else if (action == "set") {
       entry.is_removal = false;
-
-      // Parse items array for set action
-      auto items_it = entry_obj.find("items");
-      if (items_it == entry_obj.end() ||
-          items_it->second.type() != json_spirit::array_type) {
-        parse_errors << "mapping[" << i << "] 'set' action requires 'items' array";
+      it = obj.find("items");
+      if (it == obj.end() || it->second.type() != json_spirit::array_type) {
+        ss << "set action requires 'items' array";
         return -EINVAL;
       }
-      const auto& items_arr = items_it->second.get_array();
-      for (size_t j = 0; j < items_arr.size(); j++) {
-        if (items_arr[j].type() != json_spirit::array_type) {
-          parse_errors << "mapping[" << i << "] items[" << j << "] must be [from, to] array";
+      for (const auto& item : it->second.get_array()) {
+        if (item.type() != json_spirit::array_type) {
+          ss << "item must be [from, to] array";
           return -EINVAL;
         }
-        const auto& pair_arr = items_arr[j].get_array();
-        if (pair_arr.size() != 2 ||
-            pair_arr[0].type() != json_spirit::int_type ||
-            pair_arr[1].type() != json_spirit::int_type) {
-          parse_errors << "mapping[" << i << "] items[" << j << "] must be [from, to] integers";
+        const auto& p = item.get_array();
+        if (p.size() != 2 || p[0].type() != json_spirit::int_type ||
+            p[1].type() != json_spirit::int_type) {
+          ss << "item must be [int, int]";
           return -EINVAL;
         }
-        int from = pair_arr[0].get_int();
-        int to = pair_arr[1].get_int();
-        entry.items.push_back(make_pair(from, to));
+        entry.items.emplace_back(p[0].get_int(), p[1].get_int());
       }
       if (entry.items.empty()) {
-        parse_errors << "mapping[" << i << "] 'items' array is empty";
+        ss << "items array is empty";
         return -EINVAL;
       }
     } else {
-      parse_errors << "mapping[" << i << "] invalid action '" << action
-                   << "' (must be 'set' or 'rm')";
+      ss << "invalid action: " << action;
       return -EINVAL;
     }
 
@@ -10654,6 +10625,106 @@ static int parse_bulk_upmap_items(
   }
 
   return 0;
+}
+
+// Parse simple format:
+//   rm <pgid> [rm <pgid>...] set <pgid> <from> <to> [<from> <to>...] [set ...]
+// Example: rm 1.0 rm 1.1 set 1.2 0 1 2 3 set 1.3 4 5
+static int parse_bulk_upmap_items_simple(
+    const vector<string>& args,
+    vector<BulkUpmapEntry>* entries,
+    stringstream& parse_errors)
+{
+  size_t i = 0;
+  while (i < args.size()) {
+    const string& action = args[i];
+
+    if (action != "rm" && action != "set") {
+      parse_errors << "expected 'rm' or 'set', got '" << action << "'";
+      return -EINVAL;
+    }
+
+    // Next token must be pgid
+    if (++i >= args.size()) {
+      parse_errors << "'" << action << "' requires a pgid";
+      return -EINVAL;
+    }
+
+    pg_t pgid;
+    if (!pgid.parse(args[i].c_str())) {
+      parse_errors << "invalid pgid '" << args[i] << "'";
+      return -EINVAL;
+    }
+    i++;
+
+    BulkUpmapEntry entry;
+    entry.pgid = pgid;
+
+    if (action == "rm") {
+      entry.is_removal = true;
+    } else {
+      // "set" - consume pairs until we hit "rm", "set", or end
+      entry.is_removal = false;
+
+      while (i < args.size() && args[i] != "rm" && args[i] != "set") {
+        // Need two integers for a pair
+        if (i + 1 >= args.size() || args[i + 1] == "rm" || args[i + 1] == "set") {
+          parse_errors << "incomplete pair for pgid " << pgid
+                       << " (need both 'from' and 'to' osd)";
+          return -EINVAL;
+        }
+
+        string err;
+        int from = strict_strtol(args[i].c_str(), 10, &err);
+        if (!err.empty()) {
+          parse_errors << "invalid 'from' osd '" << args[i] << "': " << err;
+          return -EINVAL;
+        }
+        int to = strict_strtol(args[i + 1].c_str(), 10, &err);
+        if (!err.empty()) {
+          parse_errors << "invalid 'to' osd '" << args[i + 1] << "': " << err;
+          return -EINVAL;
+        }
+
+        entry.items.push_back(make_pair(from, to));
+        i += 2;
+      }
+
+      if (entry.items.empty()) {
+        parse_errors << "'set' for pgid " << pgid << " requires at least one from/to pair";
+        return -EINVAL;
+      }
+    }
+
+    entries->push_back(std::move(entry));
+  }
+
+  return 0;
+}
+
+static int parse_bulk_upmap_items(
+    CephContext* cct,
+    const cmdmap_t& cmdmap,
+    const OSDMap& osdmap,
+    const bufferlist& inbuf,
+    vector<BulkUpmapEntry>* entries,
+    stringstream& parse_errors)
+{
+  // check input via -i <file>
+  if (inbuf.length() > 0) {
+    string json_str = inbuf.to_str();
+    return parse_bulk_upmap_items_json(json_str, entries, parse_errors);
+  }
+
+  vector<string> args;
+  if (!cmd_getval(cmdmap, "args", args) || args.empty()) {
+    parse_errors << "no arguments provided. "
+                 << "Usage: set <pgid> <from> <to> [...] [rm <pgid>] ... "
+                 << "or use -i <file.json>";
+    return -EINVAL;
+  }
+
+  return parse_bulk_upmap_items_simple(args, entries, parse_errors);
 }
 
 int OSDMonitor::prepare_command_osd_destroy(
@@ -13089,7 +13160,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
              prefix == "osd rm-pg-upmap-items" ||
 	     prefix == "osd pg-upmap-primary" ||
 	     prefix == "osd rm-pg-upmap-primary" ||
-	     prefix == "osd rm-pg-upmap-primary-all") {
+	     prefix == "osd rm-pg-upmap-primary-all" ||
+	     prefix == "osd pg-upmap-items-bulk") {
     enum {
       OP_PG_UPMAP,
       OP_RM_PG_UPMAP,
@@ -13098,6 +13170,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       OP_PG_UPMAP_PRIMARY,
       OP_RM_PG_UPMAP_PRIMARY,
       OP_RM_PG_UPMAP_PRIMARY_ALL,
+      OP_PG_UPMAP_ITEMS_BULK,
     } upmap_option;
 
     if (prefix == "osd pg-upmap") {
@@ -13114,6 +13187,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       upmap_option = OP_RM_PG_UPMAP_PRIMARY;
     } else if (prefix == "osd rm-pg-upmap-primary-all") {
       upmap_option = OP_RM_PG_UPMAP_PRIMARY_ALL;
+    } else if (prefix == "osd pg-upmap-items-bulk") {
+      upmap_option = OP_PG_UPMAP_ITEMS_BULK;
     } else {
       ceph_abort_msg("invalid upmap option");
     }
@@ -13125,7 +13200,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     case OP_PG_UPMAP: 		// fall through
     case OP_RM_PG_UPMAP:	// fall through
     case OP_PG_UPMAP_ITEMS:	// fall through
-    case OP_RM_PG_UPMAP_ITEMS:
+    case OP_RM_PG_UPMAP_ITEMS:	// fall through
+    case OP_PG_UPMAP_ITEMS_BULK:
       min_release = ceph_release_t::luminous;
       min_feature = CEPH_FEATUREMASK_OSDMAP_PG_UPMAP;
       feature_name = "pg-upmap";
@@ -13163,8 +13239,9 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     pg_t pgid;
     switch (upmap_option) {
     case OP_RM_PG_UPMAP_PRIMARY_ALL: // no pgid to check
+    case OP_PG_UPMAP_ITEMS_BULK:     // bulk handles pgids internally
       break;
-    
+
     case OP_PG_UPMAP:
     case OP_RM_PG_UPMAP:
     case OP_PG_UPMAP_ITEMS:
@@ -13221,6 +13298,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       }
       break;
     case OP_RM_PG_UPMAP_PRIMARY_ALL: // nothing to check
+    case OP_PG_UPMAP_ITEMS_BULK:
+      // handles pending checks internally
       break;
 
     default:
@@ -13434,171 +13513,160 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       }
       break;
 
-    default:
-      ceph_abort_msg("invalid upmap option");
-    }
-
-    goto update;
-  } else if (prefix == "osd pg-upmap-items-bulk") {
-    // Check min_compat_client for pg-upmap feature
-    if (osdmap.require_min_compat_client < ceph_release_t::luminous) {
-      ss << "min_compat_client "
-         << osdmap.require_min_compat_client
-         << " < luminous, which is required for pg-upmap. "
-         << "Try 'ceph osd set-require-min-compat-client luminous' "
-         << "before using the new interface";
-      err = -EPERM;
-      goto reply_no_propose;
-    }
-    err = check_cluster_features(CEPH_FEATUREMASK_OSDMAP_PG_UPMAP, ss);
-    if (err == -EAGAIN)
-      goto wait;
-    if (err < 0)
-      goto reply_no_propose;
-
-    // Parse JSON input
-    vector<BulkUpmapEntry> entries;
-    stringstream parse_errors;
-    err = parse_bulk_upmap_items(cct, cmdmap, osdmap, &entries, parse_errors);
-    if (err < 0) {
-      ss << "failed to parse bulk input: " << parse_errors.str();
-      goto reply_no_propose;
-    }
-    if (entries.empty()) {
-      ss << "no mappings provided";
-      err = -EINVAL;
-      goto reply_no_propose;
-    }
-
-    BulkUpmapResult result;
-
-    for (auto& entry : entries) {
-      string action_str = entry.is_removal ? "rm" : "set";
-
-      // Check pool exists
-      if (!osdmap.have_pg_pool(entry.pgid.pool())) {
-        result.failed.push_back({entry.pgid, action_str,
-          "pool does not exist"});
-        continue;
-      }
-
-      // Check for pending removal of pool
-      if (pending_inc.old_pools.count(entry.pgid.pool())) {
-        result.failed.push_back({entry.pgid, action_str,
-          "pool is pending removal"});
-        continue;
-      }
-
-      // Check for duplicate PG in this batch
-      if (pending_inc.new_pg_upmap_items.count(entry.pgid) ||
-          pending_inc.old_pg_upmap_items.count(entry.pgid)) {
-        result.failed.push_back({entry.pgid, action_str,
-          "pg already has pending changes in this batch"});
-        continue;
-      }
-
-      if (entry.is_removal) {
-        // Handle removal
-        if (!osdmap.have_pg_upmaps(entry.pgid)) {
-          result.failed.push_back({entry.pgid, "rm",
-            "pg has no upmap-items to remove"});
-          continue;
+      case OP_PG_UPMAP_ITEMS_BULK: {
+        // Parse input (CLI args or JSON file via -i)
+        vector<BulkUpmapEntry> entries;
+        stringstream parse_errors;
+        bufferlist inbuf = m->get_data();
+        err = parse_bulk_upmap_items(
+            cct, cmdmap, osdmap, inbuf, &entries, parse_errors);
+        if (err < 0) {
+          ss << "failed to parse bulk input: " << parse_errors.str();
+          goto reply_no_propose;
         }
-        pending_inc.old_pg_upmap_items.insert(entry.pgid);
-        result.applied.push_back({entry.pgid, "rm"});
-      } else {
-        // Handle set - validate items
-        int pool_size = osdmap.get_pg_pool_size(entry.pgid);
-        if ((int)entry.items.size() > pool_size) {
-          result.failed.push_back({entry.pgid, "set",
-            "num of osd pairs exceeds pool size"});
-          continue;
+        if (entries.empty()) {
+          ss << "no mappings provided";
+          err = -EINVAL;
+          goto reply_no_propose;
         }
 
-        vector<pair<int32_t,int32_t>> valid_items;
-        bool entry_valid = true;
-        string validation_error;
+        BulkUpmapResult result;
 
-        for (auto& item : entry.items) {
-          int from = item.first;
-          int to = item.second;
+        for (auto& entry : entries) {
+          string action_str = entry.is_removal ? "rm" : "set";
 
-          if (from == to) {
-            // Skip silently (matches existing behavior)
+          // Check pool exists
+          if (!osdmap.have_pg_pool(entry.pgid.pool())) {
+            result.failed.push_back(
+                {entry.pgid, action_str, "pool does not exist"});
             continue;
           }
-          if (!osdmap.exists(from)) {
-            validation_error = "osd." + std::to_string(from) + " does not exist";
-            entry_valid = false;
-            break;
+
+          // Check for pending removal of pool
+          if (pending_inc.old_pools.count(entry.pgid.pool())) {
+            result.failed.push_back(
+                {entry.pgid, action_str, "pool is pending removal"});
+            continue;
           }
-          if (to != CRUSH_ITEM_NONE && !osdmap.exists(to)) {
-            validation_error = "osd." + std::to_string(to) + " does not exist";
-            entry_valid = false;
-            break;
+
+          // Check for duplicate PG in this batch
+          if (pending_inc.new_pg_upmap_items.count(entry.pgid) ||
+              pending_inc.old_pg_upmap_items.count(entry.pgid)) {
+            result.failed.push_back(
+                {entry.pgid, action_str,
+                 "pg already has pending changes in this batch"});
+            continue;
           }
-          // Check for duplicate pair
-          auto it = std::find(valid_items.begin(), valid_items.end(), item);
-          if (it != valid_items.end()) {
-            continue;  // Skip duplicate silently
+
+          if (entry.is_removal) {
+            // Handle removal
+            if (!osdmap.have_pg_upmaps(entry.pgid)) {
+              result.failed.push_back(
+                  {entry.pgid, "rm", "pg has no upmap-items to remove"});
+              continue;
+            }
+            pending_inc.old_pg_upmap_items.insert(entry.pgid);
+            result.applied.push_back({entry.pgid, "rm"});
+          } else {
+            // Handle set - validate items
+            int pool_size = osdmap.get_pg_pool_size(entry.pgid);
+            if ((int)entry.items.size() > pool_size) {
+              result.failed.push_back(
+                  {entry.pgid, "set", "num of osd pairs exceeds pool size"});
+              continue;
+            }
+
+            vector<pair<int32_t, int32_t>> valid_items;
+            bool entry_valid = true;
+            string validation_error;
+
+            for (auto& item : entry.items) {
+              int from = item.first;
+              int to = item.second;
+
+              if (from == to) {
+                // Skip silently (matches existing behavior)
+                continue;
+              }
+              if (!osdmap.exists(from)) {
+                validation_error = "osd." + std::to_string(from) +
+                                   " does not exist";
+                entry_valid = false;
+                break;
+              }
+              if (to != CRUSH_ITEM_NONE && !osdmap.exists(to)) {
+                validation_error = "osd." + std::to_string(to) +
+                                   " does not exist";
+                entry_valid = false;
+                break;
+              }
+              // Check for duplicate pair
+              auto it = std::find(valid_items.begin(), valid_items.end(), item);
+              if (it != valid_items.end()) {
+                continue; // Skip duplicate silently
+              }
+              valid_items.push_back(item);
+            }
+
+            if (!entry_valid) {
+              result.failed.push_back({entry.pgid, "set", validation_error});
+              continue;
+            }
+            if (valid_items.empty()) {
+              result.failed.push_back(
+                  {entry.pgid, "set", "no valid upmap items after validation"});
+              continue;
+            }
+
+            pending_inc.new_pg_upmap_items[entry.pgid] =
+                mempool::osdmap::vector<pair<int32_t, int32_t>>(
+                    valid_items.begin(), valid_items.end());
+            result.applied.push_back({entry.pgid, "set"});
           }
-          valid_items.push_back(item);
         }
 
-        if (!entry_valid) {
-          result.failed.push_back({entry.pgid, "set", validation_error});
-          continue;
-        }
-        if (valid_items.empty()) {
-          result.failed.push_back({entry.pgid, "set",
-            "no valid upmap items after validation"});
-          continue;
+        // Only propose if we have changes
+        if (result.applied.empty()) {
+          ss << "no valid mappings to apply";
+          err = -EINVAL;
+          goto reply_no_propose;
         }
 
-        pending_inc.new_pg_upmap_items[entry.pgid] =
-          mempool::osdmap::vector<pair<int32_t,int32_t>>(
-            valid_items.begin(), valid_items.end());
-        result.applied.push_back({entry.pgid, "set"});
-      }
-    }
+        // Format response
+        if (f) {
+          f->open_object_section("result");
+          f->open_array_section("applied");
+          for (auto& [pgid, action] : result.applied) {
+            f->open_object_section("entry");
+            f->dump_stream("pgid") << pgid;
+            f->dump_string("action", action);
+            f->close_section();
+          }
+          f->close_section();
+          f->open_array_section("failed");
+          for (auto& [pgid, action, error] : result.failed) {
+            f->open_object_section("entry");
+            f->dump_stream("pgid") << pgid;
+            f->dump_string("action", action);
+            f->dump_string("error", error);
+            f->close_section();
+          }
+          f->close_section();
+          f->dump_unsigned("applied_count", result.applied.size());
+          f->dump_unsigned("failed_count", result.failed.size());
+          f->close_section();
+          f->flush(rdata);
+        } else {
+          ss << "applied " << result.applied.size() << ", failed "
+             << result.failed.size();
+        }
+      } break;
 
-    // Only propose if we have changes
-    if (result.applied.empty()) {
-      ss << "no valid mappings to apply";
-      err = -EINVAL;
-      goto reply_no_propose;
-    }
-
-    // Format response
-    if (f) {
-      f->open_object_section("result");
-      f->open_array_section("applied");
-      for (auto& [pgid, action] : result.applied) {
-        f->open_object_section("entry");
-        f->dump_stream("pgid") << pgid;
-        f->dump_string("action", action);
-        f->close_section();
+      default:
+        ceph_abort_msg("invalid upmap option");
       }
-      f->close_section();
-      f->open_array_section("failed");
-      for (auto& [pgid, action, error] : result.failed) {
-        f->open_object_section("entry");
-        f->dump_stream("pgid") << pgid;
-        f->dump_string("action", action);
-        f->dump_string("error", error);
-        f->close_section();
-      }
-      f->close_section();
-      f->dump_unsigned("applied_count", result.applied.size());
-      f->dump_unsigned("failed_count", result.failed.size());
-      f->close_section();
-      f->flush(rdata);
-    } else {
-      ss << "applied " << result.applied.size()
-         << ", failed " << result.failed.size();
-    }
 
-    goto update;
+      goto update;
   } else if (prefix == "osd primary-affinity") {
     int64_t id;
     if (!cmd_getval(cmdmap, "id", id)) {
