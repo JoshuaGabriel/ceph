@@ -10542,8 +10542,7 @@ struct BulkUpmapResult {
   vector<std::tuple<pg_t,string,string>> failed;
 };
 
-static int
-parse_bulk_upmap_items_json(
+static int parse_bulk_upmap_items_json(
     const string& json_str,
     vector<BulkUpmapEntry>* entries,
     stringstream& ss)
@@ -10627,32 +10626,29 @@ parse_bulk_upmap_items_json(
   return 0;
 }
 
-// Parse simple format:
-//   rm <pgid> [rm <pgid>...] set <pgid> <from> <to> [<from> <to>...] [set ...]
-// Example: rm 1.0 rm 1.1 set 1.2 0 1 2 3 set 1.3 4 5
 static int parse_bulk_upmap_items_simple(
     const vector<string>& args,
     vector<BulkUpmapEntry>* entries,
-    stringstream& parse_errors)
+    stringstream& ss)
 {
+  // ex: rm <pgid> [rm <pgid>...] set <pgid> <from> <to> [<from> <to>...] [set ...]
   size_t i = 0;
   while (i < args.size()) {
     const string& action = args[i];
 
     if (action != "rm" && action != "set") {
-      parse_errors << "expected 'rm' or 'set', got '" << action << "'";
+      ss << "expected 'rm' or 'set', got '" << action << "'";
       return -EINVAL;
     }
 
-    // Next token must be pgid
     if (++i >= args.size()) {
-      parse_errors << "'" << action << "' requires a pgid";
+      ss << "'" << action << "' requires a pgid";
       return -EINVAL;
     }
 
     pg_t pgid;
     if (!pgid.parse(args[i].c_str())) {
-      parse_errors << "invalid pgid '" << args[i] << "'";
+      ss << "invalid pgid '" << args[i] << "'";
       return -EINVAL;
     }
     i++;
@@ -10669,7 +10665,7 @@ static int parse_bulk_upmap_items_simple(
       while (i < args.size() && args[i] != "rm" && args[i] != "set") {
         // Need two integers for a pair
         if (i + 1 >= args.size() || args[i + 1] == "rm" || args[i + 1] == "set") {
-          parse_errors << "incomplete pair for pgid " << pgid
+          ss << "incomplete pair for pgid " << pgid
                        << " (need both 'from' and 'to' osd)";
           return -EINVAL;
         }
@@ -10677,12 +10673,12 @@ static int parse_bulk_upmap_items_simple(
         string err;
         int from = strict_strtol(args[i].c_str(), 10, &err);
         if (!err.empty()) {
-          parse_errors << "invalid 'from' osd '" << args[i] << "': " << err;
+          ss << "invalid 'from' osd '" << args[i] << "': " << err;
           return -EINVAL;
         }
         int to = strict_strtol(args[i + 1].c_str(), 10, &err);
         if (!err.empty()) {
-          parse_errors << "invalid 'to' osd '" << args[i + 1] << "': " << err;
+          ss << "invalid 'to' osd '" << args[i + 1] << "': " << err;
           return -EINVAL;
         }
 
@@ -10691,7 +10687,7 @@ static int parse_bulk_upmap_items_simple(
       }
 
       if (entry.items.empty()) {
-        parse_errors << "'set' for pgid " << pgid << " requires at least one from/to pair";
+        ss << "'set' for pgid " << pgid << " requires at least one from/to pair";
         return -EINVAL;
       }
     }
@@ -10708,23 +10704,23 @@ static int parse_bulk_upmap_items(
     const OSDMap& osdmap,
     const bufferlist& inbuf,
     vector<BulkUpmapEntry>* entries,
-    stringstream& parse_errors)
+    stringstream& ss)
 {
   // check input via -i <file>
   if (inbuf.length() > 0) {
     string json_str = inbuf.to_str();
-    return parse_bulk_upmap_items_json(json_str, entries, parse_errors);
+    return parse_bulk_upmap_items_json(json_str, entries, ss);
   }
 
   vector<string> args;
   if (!cmd_getval(cmdmap, "args", args) || args.empty()) {
-    parse_errors << "no arguments provided. "
+    ss << "no arguments provided. "
                  << "Usage: set <pgid> <from> <to> [...] [rm <pgid>] ... "
                  << "or use -i <file.json>";
     return -EINVAL;
   }
 
-  return parse_bulk_upmap_items_simple(args, entries, parse_errors);
+  return parse_bulk_upmap_items_simple(args, entries, ss);
 }
 
 int OSDMonitor::prepare_command_osd_destroy(
@@ -13516,12 +13512,12 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       case OP_PG_UPMAP_ITEMS_BULK: {
         // Parse input (CLI args or JSON file via -i)
         vector<BulkUpmapEntry> entries;
-        stringstream parse_errors;
+        stringstream ss;
         bufferlist inbuf = m->get_data();
         err = parse_bulk_upmap_items(
-            cct, cmdmap, osdmap, inbuf, &entries, parse_errors);
+            cct, cmdmap, osdmap, inbuf, &entries, ss);
         if (err < 0) {
-          ss << "failed to parse bulk input: " << parse_errors.str();
+          ss << "failed to parse bulk input: " << ss.str();
           goto reply_no_propose;
         }
         if (entries.empty()) {
