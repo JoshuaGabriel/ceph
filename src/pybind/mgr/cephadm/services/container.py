@@ -1,5 +1,5 @@
 import logging
-from typing import List, Any, Tuple, Dict, cast
+from typing import List, Any, Tuple, Dict, cast, override
 
 from ceph.deployment.service_spec import CustomContainerSpec
 from .service_registry import register_cephadm_service
@@ -29,3 +29,11 @@ class CustomContainerService(CephadmService):
             'Generated configuration for \'%s\' service: config-json=%s, dependencies=%s' %
             (self.TYPE, config, deps))
         return config, deps
+
+    @property
+    @override
+    def needs_monitoring(self) -> bool:
+        return any(
+            getattr(cast(CustomContainerSpec, sd.spec), 'prometheus_sd', False)
+            for sd in self.mgr.spec_store.get_by_service_type(self.TYPE)
+        )

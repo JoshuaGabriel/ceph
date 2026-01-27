@@ -2748,6 +2748,9 @@ class CustomContainerSpec(ServiceSpec):
                  extra_entrypoint_args: Optional[GeneralArgList] = None,
                  custom_configs: Optional[List[CustomConfig]] = None,
                  init_containers: Optional[List[Union['InitContainerSpec', Dict[str, Any]]]] = None,
+                 prometheus_sd: bool = False,
+                 prometheus_sd_port_index: int = 0,
+                 prometheus_sd_port: Optional[int] = None,
                  ):
         assert service_type == 'container'
         assert service_id is not None
@@ -2778,6 +2781,9 @@ class CustomContainerSpec(ServiceSpec):
             self.init_containers = InitContainerSpec.import_values(
                 init_containers
             )
+        self.prometheus_sd = prometheus_sd
+        self.prometheus_sd_port_index = prometheus_sd_port_index
+        self.prometheus_sd_port = prometheus_sd_port
 
     def config_json(self) -> Dict[str, Any]:
         """
@@ -2809,6 +2815,20 @@ class CustomContainerSpec(ServiceSpec):
             raise SpecValidationError(
                 '"files" and "custom_configs" are mutually exclusive '
                 '(and both serve the same purpose)')
+
+        if self.prometheus_sd:
+            if not self.ports and not self.prometheus_sd_port:
+                raise SpecValidationError(
+                    'prometheus_sd requires at least one port to be specified '
+                    '(via "ports" or "prometheus_sd_port")')
+            if self.prometheus_sd_port is not None and self.prometheus_sd_port_index != 0:
+                raise SpecValidationError(
+                    '"prometheus_sd_port" and "prometheus_sd_port_index" are '
+                    'mutually exclusive')
+            if self.ports and not self.prometheus_sd_port and self.prometheus_sd_port_index >= len(self.ports):
+                raise SpecValidationError(
+                    f'prometheus_sd_port_index ({self.prometheus_sd_port_index}) '
+                    f'is out of range for ports list (length {len(self.ports)})')
 
     # use quotes for OrderedDict, getting this to work across py 3.6, 3.7
     # and 3.7+ is suprisingly difficult

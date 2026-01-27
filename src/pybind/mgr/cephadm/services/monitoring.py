@@ -12,8 +12,8 @@ from cephadm.services.service_registry import service_registry
 from cephadm.tlsobject_types import TLSCredentials
 
 from orchestrator import DaemonDescription
-from ceph.deployment.service_spec import AlertManagerSpec, GrafanaSpec, ServiceSpec, \
-    SNMPGatewaySpec, PrometheusSpec, MgmtGatewaySpec
+from ceph.deployment.service_spec import AlertManagerSpec, GrafanaSpec, \
+    ServiceSpec, SNMPGatewaySpec, PrometheusSpec, MgmtGatewaySpec
 from cephadm.services.cephadmservice import CephadmService, CephadmDaemonDeploySpec, get_dashboard_urls
 from mgr_util import build_url, password_hash
 from ceph.deployment.utils import wrap_ipv6

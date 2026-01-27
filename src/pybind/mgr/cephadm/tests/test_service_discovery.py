@@ -81,9 +81,21 @@ class FakeServiceSpec:
         return 9922
 
 
+class FakeCustomContainerSpec:
+    def __init__(self, prometheus_sd=False, prometheus_sd_port_index=0,
+                 prometheus_sd_port=None, service_id=None):
+        self.service_type = 'container'
+        self.service_id = service_id
+        self.prometheus_sd = prometheus_sd
+        self.prometheus_sd_port_index = prometheus_sd_port_index
+        self.prometheus_sd_port = prometheus_sd_port
+
+
 class FakeSpecDescription:
-    def __init__(self, service, port):
-        if service == 'ingress':
+    def __init__(self, service, port, spec=None):
+        if spec:
+            self.spec = spec
+        elif service == 'ingress':
             self.spec = FakeIngressServiceSpec(port)
         elif service == 'nfs':
             self.spec = FakeNFSServiceSpec(port)
@@ -94,13 +106,29 @@ class FakeSpecDescription:
 class FakeSpecStore():
     def __init__(self, mgr):
         self.mgr = mgr
-        self._specs = {'ingress': FakeSpecDescription('ingress', 9049), 'nfs': FakeSpecDescription('nfs', 9587), 'smb': FakeSpecDescription('smb', 9922)}
+        self._specs = {
+            "ingress": FakeSpecDescription("ingress", 9049),
+            "nfs": FakeSpecDescription("nfs", 9587),
+            "smb": FakeSpecDescription("smb", 9922),
+            "container.custom-container": FakeSpecDescription(
+                "container",
+                9123,
+                spec=FakeCustomContainerSpec(
+                    prometheus_sd=True,
+                    service_id="custom-container",
+                ),
+            ),
+        }
 
     def __contains__(self, name):
         return name in self._specs
 
     def __getitem__(self, name):
         return self._specs[name]
+
+    def get_by_service_type(self, service_type):
+        return [v for k, v in self._specs.items()
+                if getattr(v.spec, 'service_type', '') == service_type]
 
 
 class FakeMgr:
@@ -261,7 +289,7 @@ class TestServiceDiscovery:
     def test_get_sd_config_custom_container(self):
         mgr = FakeMgr()
         root = Root(mgr, 5000, '0.0.0.0')
-        cfg = root.get_sd_config('container.custom-container')
+        cfg = root.get_sd_config('container')
 
         # check response structure
         assert cfg
@@ -271,6 +299,51 @@ class TestServiceDiscovery:
 
         # check content
         assert cfg[0]['targets'] == ['1.2.3.4:9123']
+        assert cfg[0]['labels'] == {
+            'job': 'container',
+            'instance': 'node0',
+            'ceph_service': 'container.custom-container',
+        }
+        assert cfg[1]['targets'] == ['1.2.3.5:9123']
+        assert cfg[1]['labels'] == {
+            'job': 'container',
+            'instance': 'node1',
+            'ceph_service': 'container.custom-container',
+        }
+
+    def test_get_sd_config_container_with_sd_port(self):
+        mgr = FakeMgr()
+        mgr.spec_store._specs['container.custom-container'] = FakeSpecDescription(
+            "container",
+            9123,
+            spec=FakeCustomContainerSpec(
+                prometheus_sd=True,
+                prometheus_sd_port=9999,
+                service_id="custom-container",
+            ),
+        )
+        root = Root(mgr, 5000, '0.0.0.0')
+        cfg = root.get_sd_config('container')
+
+        assert cfg
+        assert cfg[0]['targets'] == ['1.2.3.4:9999']
+        assert cfg[1]['targets'] == ['1.2.3.5:9999']
+
+    def test_get_sd_config_container_filtered_by_service_name(self):
+        mgr = FakeMgr()
+        root = Root(mgr, 5000, '0.0.0.0')
+        cfg = root.get_sd_config('container.custom-container')
+
+        assert cfg
+        assert len(cfg) == 2
+        assert cfg[0]['labels']['ceph_service'] == 'container.custom-container'
+
+    def test_get_sd_config_container_filtered_no_match(self):
+        mgr = FakeMgr()
+        root = Root(mgr, 5000, '0.0.0.0')
+        cfg = root.get_sd_config('container.nonexistent')
+
+        assert cfg == []
 
     def test_get_sd_config_invalid_service(self):
         mgr = FakeMgr()
