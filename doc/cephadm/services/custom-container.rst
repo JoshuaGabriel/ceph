@@ -77,6 +77,18 @@ where the properties of a service specification are:
     below the directory `/var/lib/ceph/<cluster-fsid>/<daemon-name>`.
     The absolute path of the directory where the file will be created must
     exist. Use the `dirs` property to create them if necessary.
+* ``prometheus_sd``
+    Set to ``true`` to register this container with Prometheus service discovery.
+    Prometheus will automatically scrape metrics from this container.
+    Requires a port to be specified via ``ports`` or ``prometheus_sd_port``.
+    Default: ``false``.
+* ``prometheus_sd_port``
+    The port Prometheus should scrape for metrics. Use this when the metrics
+    port is not in the ``ports`` list. Mutually exclusive with
+    ``prometheus_sd_port_index``.
+* ``prometheus_sd_port_index``
+    The index into the ``ports`` list to use for Prometheus scraping.
+    Default: ``0`` (first port). Mutually exclusive with ``prometheus_sd_port``.
 * ``init_containers``
     A list of "init container" definitions. An init container exists to
     run prepratory steps before the primary container starts. Init containers
@@ -150,3 +162,73 @@ Example with init containers:
    before the service is started and is subject to start-up timeouts.
    The total run time of all init containers can not exceed 200 seconds
    or the service will fail to start.
+
+
+Prometheus Service Discovery
+============================
+
+Custom containers that expose Prometheus metrics can be automatically registered
+with cephadm's Prometheus service discovery. This allows Prometheus to
+automatically scrape metrics from your custom containers without manual
+configuration.
+
+To enable it, set ``prometheus_sd: true`` in the spec and ensure a port is
+configured (via ``ports`` or ``prometheus_sd_port``):
+
+.. code-block:: yaml
+
+    service_type: container
+    service_id: my-exporter
+    placement:
+      hosts:
+        - node1
+        - node2
+    spec:
+      image: my-registry/my-exporter:latest
+      entrypoint: /usr/bin/my-exporter
+      ports:
+        - 9105
+      prometheus_sd: true
+
+When ``prometheus_sd`` is enabled, cephadm will:
+
+1. Register the container with the service discovery endpoint
+2. Automatically add the container to the Prometheus scrape configuration
+3. Reconfigure Prometheus when container daemons are added or removed
+
+All monitored custom containers are grouped under a single ``container`` job
+in Prometheus. Each target includes a ``ceph_service`` label to distinguish
+between different container services.
+
+Verify the service discovery registration:
+
+.. prompt:: bash #
+
+   curl "http://<mgr-ip>:8765/sd/prometheus/sd-config?service=container"
+
+This returns the discovered targets:
+
+.. code-block:: json
+
+    [
+      {
+        "targets": ["node1:9105"],
+        "labels": {
+          "job": "container",
+          "instance": "node1",
+          "ceph_service": "container.my-exporter"
+        }
+      },
+      {
+        "targets": ["node2:9105"],
+        "labels": {
+          "job": "container",
+          "instance": "node2",
+          "ceph_service": "container.my-exporter"
+        }
+      }
+    ]
+
+Prometheus will automatically include a scrape job for the container using
+``http_sd_configs``, so targets are dynamically discovered as you add or
+remove container daemons on hosts.
