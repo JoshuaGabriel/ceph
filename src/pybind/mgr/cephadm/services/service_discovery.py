@@ -188,11 +188,12 @@ class Root(Server):
         """
         targets = []
         mgr_daemons = self.mgr.cache.get_daemons_by_service('mgr')
-        host = service_registry.get_service('mgr').get_active_daemon(mgr_daemons).hostname or ''
-        fqdn = self.mgr.get_fqdn(host)
+        active_daemon = service_registry.get_service('mgr').get_active_daemon(mgr_daemons)
+        host = active_daemon.hostname or ''
+        addr = active_daemon.ip if active_daemon.ip else self.mgr.inventory.get_addr(host)
         port = self.mgr.get_module_option_ex(
             'prometheus', 'server_port', PrometheusService.DEFAULT_MGR_PROMETHEUS_PORT)
-        targets.append(f'{fqdn}:{port}')
+        targets.append(f'{addr}:{port}')
         return [{"targets": targets, "labels": {}}]
 
     def alertmgr_sd_config(self) -> List[Dict[str, Collection[str]]]:
