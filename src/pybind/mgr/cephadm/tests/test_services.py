@@ -5152,6 +5152,7 @@ class TestMgmtGateway:
                                                      proxy_ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
                                                      proxy_ssl_verify on;
                                                      proxy_ssl_verify_depth 2;
+                                                     proxy_set_header Authorization "Basic YWRtaW46YWRtaW4=";
                                                  }
 
                                                  location /alertmanager {
@@ -5162,6 +5163,7 @@ class TestMgmtGateway:
                                                      proxy_ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
                                                      proxy_ssl_verify on;
                                                      proxy_ssl_verify_depth 2;
+                                                     proxy_set_header Authorization "Basic YWRtaW46YWRtaW4=";
                                                  }
                                              }"""),
                     "nginx_internal_server.conf": dedent("""
@@ -5204,6 +5206,7 @@ class TestMgmtGateway:
                                                      proxy_ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
                                                      proxy_ssl_verify on;
                                                      proxy_ssl_verify_depth 2;
+                                                     proxy_set_header Authorization "Basic YWRtaW46YWRtaW4=";
                                                  }
 
                                                  location /internal/alertmanager {
@@ -5215,6 +5218,7 @@ class TestMgmtGateway:
                                                      proxy_ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
                                                      proxy_ssl_verify on;
                                                      proxy_ssl_verify_depth 2;
+                                                     proxy_set_header Authorization "Basic YWRtaW46YWRtaW4=";
                                                  }
                                              }"""),
                     "nginx_internal.crt": f"{ceph_generated_cert}",
@@ -5476,6 +5480,7 @@ class TestMgmtGateway:
                                                      proxy_ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
                                                      proxy_ssl_verify on;
                                                      proxy_ssl_verify_depth 2;
+                                                     proxy_set_header Authorization "Basic YWRtaW46YWRtaW4=";
                                                      auth_request /oauth2/auth;
                                                      error_page 401 = /oauth2/sign_in;
 
@@ -5496,6 +5501,7 @@ class TestMgmtGateway:
                                                      proxy_ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
                                                      proxy_ssl_verify on;
                                                      proxy_ssl_verify_depth 2;
+                                                     proxy_set_header Authorization "Basic YWRtaW46YWRtaW4=";
                                                      auth_request /oauth2/auth;
                                                      error_page 401 = /oauth2/sign_in;
 
@@ -5548,6 +5554,7 @@ class TestMgmtGateway:
                                                      proxy_ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
                                                      proxy_ssl_verify on;
                                                      proxy_ssl_verify_depth 2;
+                                                     proxy_set_header Authorization "Basic YWRtaW46YWRtaW4=";
                                                  }
 
                                                  location /internal/alertmanager {
@@ -5559,6 +5566,7 @@ class TestMgmtGateway:
                                                      proxy_ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
                                                      proxy_ssl_verify on;
                                                      proxy_ssl_verify_depth 2;
+                                                     proxy_set_header Authorization "Basic YWRtaW46YWRtaW4=";
                                                  }
                                              }"""),
                     "nginx_internal.crt": f"{ceph_generated_cert}",

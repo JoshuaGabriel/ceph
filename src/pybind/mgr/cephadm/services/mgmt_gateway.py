@@ -1,9 +1,11 @@
+import base64
 import logging
 from typing import List, Any, Tuple, Dict, cast, Optional, TYPE_CHECKING
 
 from orchestrator import DaemonDescription
 from ceph.deployment.service_spec import MgmtGatewaySpec, GrafanaSpec, ServiceSpec
 from cephadm.services.cephadmservice import CephadmService, CephadmDaemonDeploySpec, get_dashboard_endpoints
+from .. import utils
 from .service_registry import register_cephadm_service
 
 if TYPE_CHECKING:
@@ -63,6 +65,10 @@ class MgmtGatewayService(CephadmService):
             sd_endpoints.append(f"{addr}:{self.mgr.service_discovery_port}")
         return sd_endpoints
 
+    @staticmethod
+    def _basic_auth_header(user: str, password: str) -> str:
+        return base64.b64encode(f'{user}:{password}'.encode('utf-8')).decode('utf-8')
+
     @classmethod
     def get_dependencies(cls, mgr: "CephadmOrchestrator",
                          spec: Optional[ServiceSpec] = None,
@@ -79,6 +85,14 @@ class MgmtGatewayService(CephadmService):
             for service in ['mgr']
             for d in mgr.cache.get_daemons_by_service(service)
         ]
+
+        prometheus_user, prometheus_password = mgr._get_prometheus_credentials()
+        if prometheus_user and prometheus_password:
+            deps.append(f'{utils.md5_hash(prometheus_user + prometheus_password)}')
+        alertmanager_user, alertmanager_password = mgr._get_alertmanager_credentials()
+        if alertmanager_user and alertmanager_password:
+            deps.append(f'{utils.md5_hash(alertmanager_user + alertmanager_password)}')
+
         return deps
 
     def generate_config(self, daemon_spec: CephadmDaemonDeploySpec) -> Tuple[Dict[str, Any], List[str]]:
@@ -96,6 +110,16 @@ class MgmtGatewayService(CephadmService):
             grafana_protocol = grafana_spec.protocol
         except Exception:
             grafana_protocol = 'https'  # default to https just for UT
+
+        _, _, oauth2_enabled = self.mgr._get_security_config()
+        if not oauth2_enabled:
+            prom_user, prom_pass = self.mgr._get_prometheus_credentials()
+            am_user, am_pass = self.mgr._get_alertmanager_credentials()
+            prometheus_basic_auth = self._basic_auth_header(prom_user, prom_pass)
+            alertmanager_basic_auth = self._basic_auth_header(am_user, am_pass)
+        else:
+            prometheus_basic_auth = ''
+            alertmanager_basic_auth = ''
 
         main_context = {
             'dashboard_endpoints': dashboard_endpoints,
@@ -118,6 +142,8 @@ class MgmtGatewayService(CephadmService):
             'grafana_endpoints': grafana_endpoints,
             'service_discovery_endpoints': service_discovery_endpoints,
             'enable_oauth2_proxy': bool(oauth2_proxy_endpoints),
+            'prometheus_basic_auth': prometheus_basic_auth,
+            'alertmanager_basic_auth': alertmanager_basic_auth,
         }
 
         ip = self.get_mgmt_gw_ip(svc_spec, daemon_spec)

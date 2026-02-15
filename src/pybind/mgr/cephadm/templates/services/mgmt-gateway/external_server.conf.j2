@@ -156,6 +156,9 @@ server {
         proxy_ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
         proxy_ssl_verify on;
         proxy_ssl_verify_depth 2;
+        {% if prometheus_basic_auth %}
+        proxy_set_header Authorization "Basic {{ prometheus_basic_auth }}";
+        {% endif %}
         {% if enable_oauth2_proxy %}
         auth_request /oauth2/auth;
         error_page 401 = /oauth2/sign_in;
@@ -180,6 +183,9 @@ server {
         proxy_ssl_trusted_certificate /etc/nginx/ssl/ca.crt;
         proxy_ssl_verify on;
         proxy_ssl_verify_depth 2;
+        {% if alertmanager_basic_auth %}
+        proxy_set_header Authorization "Basic {{ alertmanager_basic_auth }}";
+        {% endif %}
         {% if enable_oauth2_proxy %}
         auth_request /oauth2/auth;
         error_page 401 = /oauth2/sign_in;
