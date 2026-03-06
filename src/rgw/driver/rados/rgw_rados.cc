@@ -5479,6 +5479,93 @@ int fixup_manifest_to_parts_len(const DoutPrefixProvider *dpp, rgw::sal::Attrs &
   return 0;
 }
 
+// DataProcessorFactory for lifecycle transitions that handles
+// decompressing from the source storage class and recompressing
+// with the destination storage class's compression settings.
+class RGWTransitionDPF : public rgw::sal::DataProcessorFactory {
+  CephContext* cct;
+  const std::string& compression_type;
+  DataProcessorFilter cb;
+  RGWGetObj_Filter* filter{&cb};
+  bool need_decompress{false};
+  RGWCompressionInfo decompress_info;
+  boost::optional<RGWGetObj_Decompress> decompress;
+  std::optional<RGWPutObj_Compress> compressor;
+  CompressorRef compressor_plugin;
+  uint64_t obj_size;
+  const DoutPrefixProvider* dpp;
+
+public:
+  RGWTransitionDPF(CephContext* cct,
+                   const std::string& compression_type,
+                   uint64_t obj_size,
+                   const DoutPrefixProvider* dpp)
+    : cct(cct),
+      compression_type(compression_type),
+      obj_size(obj_size),
+      dpp(dpp)
+  {}
+
+  int set_writer(rgw::sal::DataProcessor* writer,
+                 rgw::sal::Attrs& attrs,
+                 const DoutPrefixProvider* dpp,
+                 optional_yield y) override
+  {
+    // decompress source if needed
+    int ret = rgw_compression_info_from_attrset(attrs, need_decompress, decompress_info);
+    if (ret < 0) {
+      return ret;
+    }
+
+    if (need_decompress) {
+      obj_size = decompress_info.orig_size;
+      static constexpr bool partial_content = false;
+      decompress.emplace(cct, &decompress_info, partial_content, filter);
+      filter = &*decompress;
+    }
+
+    // remove old compression attr; finalize_attrs will set a new one if needed
+    attrs.erase(RGW_ATTR_COMPRESSION);
+
+    // compress for destination storage class
+    rgw::sal::DataProcessor* processor = writer;
+    if (compression_type != "none") {
+      compressor_plugin = Compressor::create(cct, compression_type);
+      if (!compressor_plugin) {
+        ldpp_dout(dpp, 1) << "Cannot load plugin for compression type "
+            << compression_type << dendl;
+      } else {
+        compressor.emplace(cct, compressor_plugin, processor);
+        processor = &*compressor;
+      }
+    }
+
+    cb.set_processor(processor);
+    return 0;
+  }
+
+  RGWGetObj_Filter* get_filter() override {
+    return filter;
+  }
+
+  bool need_copy_data() override {
+    return true;
+  }
+
+  void finalize_attrs(rgw::sal::Attrs& attrs) override {
+    if (compressor && compressor->is_compressed()) {
+      bufferlist tmp;
+      RGWCompressionInfo cs_info;
+      cs_info.compression_type = compressor_plugin->get_type_name();
+      cs_info.orig_size = obj_size;
+      cs_info.compressor_message = compressor->get_compressor_message();
+      cs_info.blocks = std::move(compressor->get_compression_blocks());
+      encode(cs_info, tmp);
+      attrs[RGW_ATTR_COMPRESSION] = tmp;
+    }
+  }
+};
+
 int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
                              RGWBucketInfo& bucket_info,
                              rgw_obj obj,
@@ -5530,6 +5617,9 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
     (void) decode_policy(dpp, i->second, &owner);
   }
 
+  const auto& compression_type = svc.zone->get_zone_params().get_compression_type(placement_rule);
+  RGWTransitionDPF dp_factory(cct, compression_type, obj_size, dpp);
+
   ret = copy_obj_data(obj_ctx,
                       owner,
                       bucket_info,
@@ -5543,7 +5633,7 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
                       olh_epoch,
                       real_time(),
                       nullptr /* petag */,
-                      nullptr, /* dp_factory */
+                      &dp_factory,
                       dpp,
                       y,
                       log_op);
