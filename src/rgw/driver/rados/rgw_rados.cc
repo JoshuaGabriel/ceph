@@ -37,6 +37,7 @@
 #include "rgw_cr_rados.h"
 #include "rgw_cr_rest.h"
 #include "rgw_datalog.h"
+#include "rgw_op.h"
 #include "rgw_putobj_processor.h"
 #include "rgw_lc_tier.h"
 #include "rgw_restore.h"
@@ -5443,6 +5444,10 @@ int RGWRados::copy_obj_data(RGWObjectCtx& obj_ctx,
     accounted_size = compressed ? cs_info.orig_size : ofs;
   }
 
+  if (dp_factory) {
+    accounted_size = dp_factory->get_accounted_size(accounted_size);
+  }
+
   const req_context rctx{dpp, y, nullptr};
   return aoproc.complete(accounted_size, etag, mtime, set_mtime, attrs,
 			    rgw::cksum::no_cksum, delete_at,
@@ -5478,6 +5483,114 @@ int fixup_manifest_to_parts_len(const DoutPrefixProvider *dpp, rgw::sal::Attrs &
 
   return 0;
 }
+
+/*
+ * DataProcessorFactory for lifecycle transitions.
+ *
+ * Decompresses source data (if compressed) and recompresses with the
+ * destination storage class's compression algorithm.  The caller must
+ * not construct this for encrypted objects.
+ */
+class RGWTransitionDPF : public rgw::sal::DataProcessorFactory {
+  CephContext* cct;
+  RGWObjectCtx& obj_ctx;
+  const rgw_obj& obj;
+  rgw::sal::Attrs& src_attrs;
+  uint64_t orig_size;
+  const std::string& compression_type;
+
+  DataProcessorFilter cb;
+  RGWGetObj_Filter* filter{&cb};
+
+  bool need_decompress{false};
+  RGWCompressionInfo decompress_info;
+  std::optional<RGWGetObj_Decompress> decompress;
+
+  std::optional<RGWPutObj_Compress> compressor;
+  CompressorRef compressor_plugin;
+
+public:
+  RGWTransitionDPF(CephContext* cct_,
+                   RGWObjectCtx& obj_ctx_,
+                   const rgw_obj& obj_,
+                   rgw::sal::Attrs& src_attrs_,
+                   uint64_t obj_size,
+                   const std::string& compression_type_)
+    : cct(cct_), obj_ctx(obj_ctx_), obj(obj_),
+      src_attrs(src_attrs_), orig_size(obj_size),
+      compression_type(compression_type_) {}
+
+  int set_writer(rgw::sal::DataProcessor* writer,
+                 rgw::sal::Attrs& attrs,
+                 const DoutPrefixProvider* dpp,
+                 optional_yield y) override
+  {
+    // read side: decompress if source is compressed
+    int ret = rgw_compression_info_from_attrset(src_attrs,
+                                                need_decompress,
+                                                decompress_info);
+    if (ret < 0)
+      return ret;
+
+    if (need_decompress) {
+      orig_size = decompress_info.orig_size;
+      decompress.emplace(cct, &decompress_info,
+                         false /* partial_content */, filter);
+      filter = &*decompress;
+    }
+
+    // write side: compress if destination wants it
+    rgw::sal::DataProcessor* processor = writer;
+
+    if (compression_type != "none") {
+      compressor_plugin = Compressor::create(cct, compression_type);
+      if (!compressor_plugin) {
+        ldpp_dout(dpp, 1) << "WARNING: failed to load compressor for type "
+            << compression_type << dendl;
+      } else {
+        compressor.emplace(cct, compressor_plugin, processor);
+        processor = &*compressor;
+        // tell the OSD this data is already compressed by RGW
+        obj_ctx.set_compressed(obj);
+      }
+    }
+
+    attrs.erase(RGW_ATTR_COMPRESSION);
+    cb.set_processor(processor);
+
+    // initialize decompressor block iterators for full-object read
+    if (need_decompress && orig_size > 0) {
+      off_t ofs = 0;
+      off_t end = orig_size - 1;
+      filter->fixup_range(ofs, end);
+    }
+
+    return 0;
+  }
+
+  bool need_copy_data() override { return true; }
+
+  RGWGetObj_Filter* get_filter() override { return filter; }
+
+  void finalize_attrs(rgw::sal::Attrs& attrs) override {
+    if (compressor && compressor->is_compressed()) {
+      bufferlist tmp;
+      RGWCompressionInfo cs_info;
+      cs_info.compression_type = compressor_plugin->get_type_name();
+      cs_info.orig_size = orig_size;
+      cs_info.compressor_message = compressor->get_compressor_message();
+      cs_info.blocks = std::move(compressor->get_compression_blocks());
+      encode(cs_info, tmp);
+      attrs[RGW_ATTR_COMPRESSION] = tmp;
+    }
+  }
+
+  uint64_t get_accounted_size(uint64_t default_size) override {
+    if (need_decompress)
+      return orig_size;
+    return default_size;
+  }
+};
 
 int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
                              RGWBucketInfo& bucket_info,
@@ -5530,6 +5643,40 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
     (void) decode_policy(dpp, i->second, &owner);
   }
 
+  rgw::sal::DataProcessorFactory* dp_factory = nullptr;
+  std::optional<RGWTransitionDPF> transition_dpf;
+
+  if (!attrs.count(RGW_ATTR_CRYPT_MODE)) {
+    const auto& compression_type =
+        svc.zone->get_zone_params().get_compression_type(placement_rule);
+
+    bool src_compressed = false;
+    RGWCompressionInfo cs_info;
+    ret = rgw_compression_info_from_attrset(attrs, src_compressed, cs_info);
+    if (ret < 0)
+      return ret;
+
+    /*
+     * Skip when the source already matches the destination config.
+     * "random" never matches because the stored codec is concrete
+     * (e.g. "zlib") while the config string stays "random".
+     */
+    bool already_matches =
+        compression_type != "random" &&
+        ((!src_compressed && compression_type == "none") ||
+         (src_compressed && cs_info.compression_type == compression_type));
+
+    if (!already_matches) {
+      transition_dpf.emplace(cct, obj_ctx, obj, attrs,
+                             obj_size, compression_type);
+      dp_factory = &*transition_dpf;
+    } else {
+      ldpp_dout(dpp, 20) << __func__
+          << " compression already matches dest config ("
+          << compression_type << "), skipping" << dendl;
+    }
+  }
+
   ret = copy_obj_data(obj_ctx,
                       owner,
                       bucket_info,
@@ -5543,7 +5690,7 @@ int RGWRados::transition_obj(RGWObjectCtx& obj_ctx,
                       olh_epoch,
                       real_time(),
                       nullptr /* petag */,
-                      nullptr, /* dp_factory */
+                      dp_factory,
                       dpp,
                       y,
                       log_op);
