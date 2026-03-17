@@ -682,6 +682,10 @@ void OSDMap::Incremental::encode(ceph::buffer::list& bl, uint64_t features) cons
     if (mutate_allow_crimson != mutate_allow_crimson_t::NONE) {
       target_v = std::max((uint8_t)12, target_v);
     }
+    if (new_osd_crush_scaling_factor != -1.0) {
+      target_v = std::max((uint8_t)13, target_v);
+    }
+
     ENCODE_START(target_v, 1, bl); // extended, osd-only data
     if (target_v < 7) {
       encode_addrvec_map_as_addr(new_hb_back_up, bl, features);
