@@ -729,7 +729,7 @@ seastar::future<> OSD::_add_me_to_crush()
 	w >= 0) {
       return seastar::make_ready_future<double>(w);
     } else {
-       return store.stat().then([](auto st) {
+       return store.stat().then([this](auto st) {
          auto total = st.total;
 	 return seastar::make_ready_future<double>(
            std::max(.00001,
