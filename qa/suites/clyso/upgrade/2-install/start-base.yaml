@@ -7,11 +7,12 @@ tasks:
 - cephadm:
 
 - cephadm.shell:
+    env: [base_image_name]
     host.a:
       - ceph status
       - ceph orch ps
       - ceph version
-      - echo "Starting with {{ctx.config.base_image_name}}"
+      - echo "Starting with $base_image_name"
 
 overrides:
   ceph:

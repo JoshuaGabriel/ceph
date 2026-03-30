@@ -1,20 +1,27 @@
 tasks:
-- workunit:
-    cleanup: true
-    no_coverage_and_limits: true #set this to true to avoid adjust-ulimits script since it isn't installed when only images are used
-    clients:
-        client.0:
-            - test_upgrade_downgrade.sh
-    env:
-        BASE_IMAGE: "{{ctx.config.base_image}}"
-        TARGET_IMAGE: "{{ctx.config.target_image}}"
-        BASE_IMAGE_NAME: "{{ctx.config.base_image_name}}"
-        TARGET_IMAGE_NAME: "{{ctx.config.target_image_name}}"
-        TARGET_VERSION: "{{ctx.config.target_version}}"
+- cephadm.shell:
+    env: [target_image, target_image_name, base_image_name]
+    host.a:
+      - echo "=== PRE-UPGRADE STATE ==="
+      - ceph version
+      - ceph orch ps
+      - ceph -s
+
+      - echo "Starting upgrade from $base_image_name to $target_image_name"
+      - ceph orch upgrade start --image $target_image
+      - while ceph orch upgrade status | jq '.in_progress' | grep true && ! ceph orch upgrade status | jq '.message' | grep Error ; do ceph orch ps ; ceph versions ; ceph orch upgrade status ; sleep 30 ; done
+
+      - echo "=== POST-UPGRADE VERIFICATION ==="
+      - ceph orch ps
+      - ceph versions
+      - ceph versions | jq -e '.overall | length == 1'
+      - ceph -s
+      - echo "Upgrade complete"
+
 overrides:
   ceph:
     log-ignorelist:
-      - CEPHADM_STRAY_DAEMON  
+      - CEPHADM_STRAY_DAEMON
       - CEPHADM_FAILED_DAEMON
       - CEPHADM_AGENT_DOWN
       - CEPHADM_DAEMON_PLACE_FAIL
