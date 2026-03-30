@@ -1,0 +1,8 @@
+tasks:
+- cephadm.shell:
+    host.a:
+      - ceph fs volume create cephfs
+      - ceph orch apply mds cephfs --placement="2"
+      - sleep 10
+      - ceph fs ls
+      - ceph fs status cephfs

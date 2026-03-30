@@ -1,0 +1,116 @@
+tasks:
+- print: "**** upgrading first half of cluster, with stress ****"
+- parallel:
+    - first-half-tasks
+    - first-half-sequence
+- print: "**** done upgrading first half of cluster ****"
+
+- ceph.healthy:
+
+- print: "**** thrashing mixed-version cluster ****"
+- parallel:
+    - stress-tasks
+
+- ceph.healthy:
+
+- print: "**** finishing upgrade ****"
+- parallel:
+    - second-half-tasks
+    - second-half-sequence
+
+- ceph.healthy:
+
+#################
+
+first-half-tasks:
+- radosbench:
+    clients: [client.0]
+    time: 150
+
+#################
+
+first-half-sequence:
+- cephadm.shell:
+    env: [target_image, target_image_name, base_image_name]
+    host.a:
+      - echo "Starting upgrade from $base_image_name to $target_image_name"
+      - ceph config set mgr mgr/cephadm/daemon_cache_timeout 60
+      - ceph config set global log_to_journald false --force
+
+      - echo "Upgrading mgr daemons"
+      - ceph orch upgrade start --image $target_image --daemon-types mgr
+      - while ceph orch upgrade status | jq '.in_progress' | grep true && ! ceph orch upgrade status | jq '.message' | grep Error ; do ceph orch ps ; ceph versions ; ceph orch upgrade status ; sleep 30 ; done
+
+      - echo "Upgrading 1 of 2 mon daemons"
+      - ceph orch upgrade start --image $target_image --daemon-types mon --limit 1
+      - while ceph orch upgrade status | jq '.in_progress' | grep true && ! ceph orch upgrade status | jq '.message' | grep Error ; do ceph orch ps ; ceph versions ; ceph orch upgrade status ; sleep 30 ; done
+      - sleep 60
+
+      - echo "Upgrading remaining mon daemons"
+      - ceph orch upgrade start --image $target_image --daemon-types mon
+      - while ceph orch upgrade status | jq '.in_progress' | grep true && ! ceph orch upgrade status | jq '.message' | grep Error ; do ceph orch ps ; ceph versions ; ceph orch upgrade status ; sleep 30 ; done
+      - sleep 60
+
+      - echo "Upgrading half of osds"
+      - ceph orch upgrade start --image $target_image --daemon-types osd --limit 2
+      - while ceph orch upgrade status | jq '.in_progress' | grep true && ! ceph orch upgrade status | jq '.message' | grep Error ; do ceph orch ps ; ceph versions ; ceph orch upgrade status ; sleep 30 ; done
+
+#################
+
+stress-tasks:
+- thrashosds:
+    timeout: 1200
+    chance_pgnum_grow: 1
+    chance_pgpnum_fix: 1
+    chance_thrash_cluster_full: 0
+    chance_thrash_pg_upmap: 0
+    chance_thrash_pg_upmap_items: 0
+    disable_objectstore_tool_tests: true
+    chance_force_recovery: 0
+    aggressive_pg_num_changes: false
+
+#################
+
+second-half-tasks:
+- radosbench:
+    clients: [client.0]
+    time: 150
+
+#################
+
+second-half-sequence:
+  sequential:
+    - cephadm.shell:
+        env: [target_image]
+        host.a:
+          - sleep 60
+
+          - echo "Finishing upgrade"
+          - ceph orch upgrade start --image $target_image
+          - while ceph orch upgrade status | jq '.in_progress' | grep true && ! ceph orch upgrade status | jq '.message' | grep Error ; do ceph orch ps ; ceph versions ; ceph orch upgrade status ; sleep 30 ; done
+
+          - echo "Upgrade complete"
+          - ceph orch ps
+          - ceph versions
+          - ceph versions | jq -e '.overall | length == 1'
+          - ceph -s
+
+overrides:
+  ceph:
+    log-ignorelist:
+      - is down
+      - OSD_DOWN
+      - PG_AVAILABILITY
+      - PG_DEGRADED
+      - Reduced data availability
+      - Degraded data redundancy
+      - pg .* is stuck inactive
+      - pg .* is .*degraded
+      - OSDMAP_FLAGS
+      - OSD_UPGRADE_FINISHED
+      - CEPHADM_STRAY_DAEMON
+      - CEPHADM_FAILED_DAEMON
+      - CEPHADM_AGENT_DOWN
+      - CEPHADM_DAEMON_PLACE_FAIL
+    log-only-match:
+      - CEPHADM_
