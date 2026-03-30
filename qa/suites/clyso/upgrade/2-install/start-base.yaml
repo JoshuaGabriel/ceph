@@ -1,9 +1,4 @@
 tasks:
-# Install system packages via pexec (avoids CEPH RPM installation)
-- pexec:
-    all:
-    - sudo dnf install s3cmd curl jq -y
-
 - cephadm:
 
 - cephadm.shell:
