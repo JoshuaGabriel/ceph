@@ -4,6 +4,5 @@ tasks:
       - ceph osd pool create test-pool 32
       - ceph osd pool set test-pool size 2 --yes-i-really-mean-it
       - ceph osd pool application enable test-pool rados
-- radosbench:
-    clients: [client.0]
-    time: 150
+      - rados bench -p test-pool 150 write --no-cleanup
+      - rados bench -p test-pool 60 seq
