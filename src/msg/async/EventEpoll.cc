@@ -17,6 +17,7 @@
 
 #include "common/errno.h"
 #include <fcntl.h>
+#include <sys/epoll.h>
 #include "EventEpoll.h"
 #include "Timeout.h"
 
@@ -33,21 +34,16 @@ int EpollDriver::init(EventCenter *c, int nevent)
     return -ENOMEM;
   }
 
-  epfd = epoll_create(1024); /* 1024 is just an hint for the kernel */
+  epfd = epoll_create1(EPOLL_CLOEXEC);
   if (epfd == -1) {
-    lderr(cct) << __func__ << " unable to do epoll_create: "
-                       << cpp_strerror(errno) << dendl;
-    return -errno;
-  }
-  if (::fcntl(epfd, F_SETFD, FD_CLOEXEC) == -1) {
     int e = errno;
-    ::close(epfd);
-    lderr(cct) << __func__ << " unable to set cloexec: "
+    lderr(cct) << __func__ << " unable to do epoll_create1: "
                        << cpp_strerror(e) << dendl;
-
+    free(events);
+    events = nullptr;
     return -e;
-  }
 
+  }
   this->nevent = nevent;
 
   return 0;
