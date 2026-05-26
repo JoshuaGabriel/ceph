@@ -2638,3 +2638,59 @@ Usage:
         completion = self.update_service(service_type.value, service_type.name, image)
         raise_if_exception(completion)
         return HandleCommandResult(stdout=completion.result_str())
+
+    @OrchestratorCLICommand.Read('orch action ls')
+    def _list_actions(self, format: Format = Format.plain) -> HandleCommandResult:
+        """
+        List scheduled daemon actions
+        """
+        completion = self.list_daemon_actions()
+        actions = raise_if_exception(completion)
+        if not actions:
+            return HandleCommandResult(stdout="No scheduled actions")
+
+        table = PrettyTable(
+            ['HOST', 'DAEMON', 'ACTION'],
+            border=False)
+        table.align = 'l'
+        table.left_padding_width = 0
+        table.right_padding_width = 2
+
+        for host, daemon_name, action in actions:
+            table.add_row([host, daemon_name, action])
+
+        if format == Format.plain:
+            return HandleCommandResult(stdout=table.get_string())
+        else:
+            return HandleCommandResult(
+                stdout=to_format(
+                    [{
+                        'host': host,
+                        'daemon': daemon_name,
+                        'action': action,
+                    } for host, daemon_name, action in actions],
+                    format,
+                    many=True,
+                    cls=None
+                )
+            )
+
+    @OrchestratorCLICommand.Write('orch daemon cancel action')
+    def _cancel_action(self, daemon_name: str) -> HandleCommandResult:
+        """
+        Cancel a scheduled daemon action
+        """
+        completion = self.cancel_daemon_action(daemon_name)
+        result = raise_if_exception(completion)
+        if not result:
+            return HandleCommandResult(stderr=f"No scheduled action found for daemon {daemon_name}")
+        return HandleCommandResult(stdout=f"Canceled scheduled action for daemon {daemon_name}")
+
+    @OrchestratorCLICommand.Write('orch service cancel action')
+    def _cancel_service_actions(self, service_name: str) -> HandleCommandResult:
+        """
+        Cancel all scheduled actions for a service
+        """
+        completion = self.cancel_service_actions(service_name)
+        result = raise_if_exception(completion)
+        return HandleCommandResult(stdout=result)

@@ -3113,3 +3113,53 @@ Traceback (most recent call last):
                 assert wait(cephadm_module, c) == ['Scheduled osd.foo update...']
 
                 cephadm_module.set_osd_spec('osd.foo', ['1'])
+
+    @mock.patch("cephadm.module.HostCache.save_host")
+    def test_list_and_cancel_daemon_action(self, _save_host, cephadm_module: CephadmOrchestrator):
+        """
+        Schedule a daemon action, list it, then cancel it via cancel_daemon_action.
+        """
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, RGWSpec(service_id='foo'),
+                              CephadmOrchestrator.apply_rgw, 'test') as d_names:
+                [daemon_name] = d_names
+
+                cephadm_module._schedule_daemon_action(daemon_name, 'restart')
+                assert cephadm_module.cache.get_scheduled_daemon_action(
+                    'test', daemon_name) == 'restart'
+
+                actions = wait(cephadm_module, cephadm_module.list_daemon_actions())
+                assert actions == [('test', daemon_name, 'restart')]
+
+                assert wait(cephadm_module,
+                            cephadm_module.cancel_daemon_action(daemon_name)) is True
+                assert cephadm_module.cache.get_scheduled_daemon_action(
+                    'test', daemon_name) is None
+
+                actions = wait(cephadm_module, cephadm_module.list_daemon_actions())
+                assert actions == []
+
+                _save_host.assert_called_with('test')
+
+    @mock.patch("cephadm.module.HostCache.save_host")
+    def test_cancel_service_actions(self, _save_host, cephadm_module: CephadmOrchestrator):
+        """
+        Schedule a daemon action then cancel via the service name.
+        """
+        with with_host(cephadm_module, 'test'):
+            with with_service(cephadm_module, RGWSpec(service_id='foo'),
+                              CephadmOrchestrator.apply_rgw, 'test') as d_names:
+                [daemon_name] = d_names
+
+                cephadm_module._schedule_daemon_action(daemon_name, 'restart')
+                actions = wait(cephadm_module, cephadm_module.list_daemon_actions())
+                assert len(actions) == 1
+
+                msg = wait(cephadm_module,
+                           cephadm_module.cancel_service_actions('rgw.foo'))
+                assert 'Canceled 1' in msg
+
+                actions = wait(cephadm_module, cephadm_module.list_daemon_actions())
+                assert actions == []
+
+                _save_host.assert_called_with('test')

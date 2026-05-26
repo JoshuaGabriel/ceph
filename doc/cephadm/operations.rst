@@ -243,6 +243,53 @@ new key) with the following command:
 For MDS, OSD, and Manager daemons, this does not require a daemon restart.  For other
 daemons, however (e.g., RGW), the daemon may be restarted to switch to the new key.
 
+Listing scheduled daemon actions
+--------------------------------
+
+Actions including restarts can be performed on daemons and services.
+
+.. prompt:: bash #
+
+   ceph orch restart osd.all-available-devices
+
+::
+
+   Scheduled to restart osd.5 on host 'cephadm-2'
+   Scheduled to restart osd.2 on host 'cephadm-2'
+   Scheduled to restart osd.0 on host 'cephadm-3'
+   Scheduled to restart osd.3 on host 'cephadm-3'
+   Scheduled to restart osd.1 on host 'cephadm-4'
+   Scheduled to restart osd.4 on host 'cephadm-4'
+
+These scheduled actions are processed by cephadm asynchronously. The
+ongoing actions can be listed with the ``action ls`` command:
+
+.. prompt:: bash #
+
+   ceph orch action ls
+
+::
+
+   HOST       DAEMON  ACTION
+   cephadm-2  osd.5   restart
+   cephadm-2  osd.2   restart
+   cephadm-3  osd.0   restart
+   cephadm-3  osd.3   restart
+   cephadm-4  osd.1   restart
+   cephadm-4  osd.4   restart
+
+A scheduled action can be canceled for an individual daemon:
+
+.. prompt:: bash #
+
+   ceph orch daemon cancel action osd.5
+
+Or for every daemon belonging to a service:
+
+.. prompt:: bash #
+
+   ceph orch service cancel action osd.all-available-devices
+
 
 .. _cephadm-logs:
 

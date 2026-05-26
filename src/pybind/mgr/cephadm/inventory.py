@@ -1615,6 +1615,14 @@ class HostCache():
 
         return self.scheduled_daemon_actions.get(host, {}).get(daemon)
 
+    def get_all_scheduled_actions(self) -> List[Tuple[str, str, str]]:
+        """Get all scheduled actions as a list of (host, daemon_name, action)"""
+        result = []
+        for host, actions in self.scheduled_daemon_actions.items():
+            for daemon_name, action in actions.items():
+                result.append((host, daemon_name, action))
+        return result
+
     def get_host_network_ips(self, host: str) -> List[str]:
         return [
             ip

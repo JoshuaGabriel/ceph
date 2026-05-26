@@ -4515,3 +4515,53 @@ Then run the following:
     def trigger_connect_dashboard_rgw(self) -> None:
         self.need_connect_dashboard_rgw = True
         self.event.set()
+
+    @handle_orch_error
+    def list_daemon_actions(self) -> List[Tuple[str, str, str]]:
+        """
+        List scheduled daemon actions
+        Returns:
+            List of tuples containing (host, daemon_name, action)
+        """
+        return self.cache.get_all_scheduled_actions()
+
+    @handle_orch_error
+    def cancel_daemon_action(self, daemon_name: str) -> bool:
+        """
+        Cancel a scheduled daemon action
+        """
+        for host, scheduled_daemon, _ in self.cache.get_all_scheduled_actions():
+            if daemon_name == scheduled_daemon:
+                self.cache.rm_scheduled_daemon_action(host, daemon_name)
+                self.cache.save_host(host)
+                return True
+        return False
+
+    @handle_orch_error
+    def cancel_service_actions(self, service_name: str) -> str:
+        """
+        Cancel all scheduled actions for a service
+        """
+        count = 0
+        daemons = self.cache.get_daemons_by_service(service_name)
+        daemon_names = [d.name() for d in daemons]
+
+        for host, daemon_name, _ in self.cache.get_all_scheduled_actions():
+            if daemon_name in daemon_names:
+                self.cache.rm_scheduled_daemon_action(host, daemon_name)
+                self.cache.save_host(host)
+                count += 1
+
+        if count == 0:
+            return f"No scheduled actions found for service {service_name}"
+        return f"Canceled {count} scheduled action(s) for service {service_name}"
+
+    @handle_orch_error
+    def rm_daemon_action(self, host: str, daemon_name: str) -> bool:
+        """
+        Remove a scheduled daemon action directly given the host and daemon_name
+        """
+        if self.cache.rm_scheduled_daemon_action(host, daemon_name):
+            self.cache.save_host(host)
+            return True
+        return False
