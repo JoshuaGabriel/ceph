@@ -1018,19 +1018,15 @@ COMMAND("osd rm-pg-upmap "
 	"clear pg_upmap mapping for <pgid> (developers only)",
         "osd", "rw")
 COMMAND("osd pg-upmap-items "
-	"name=pgid,type=CephPgid "
-	"name=id,type=CephOsdName,n=N",
-	"set pg_upmap_items mapping <pgid>:{<id> to <id>, [...]} (developers only)",
+	"name=args,type=CephString,n=N",
+	"set pg_upmap_items mapping for one or more pgs in a single osdmap epoch: "
+	"<pgid> <from id> <to id> [<from id> <to id>...] "
+	"[<pgid2> <from id> <to id>...] (developers only)",
         "osd", "rw")
 COMMAND("osd rm-pg-upmap-items "
-	"name=pgid,type=CephPgid",
-	"clear pg_upmap_items mapping for <pgid> (developers only)",
-        "osd", "rw")
-COMMAND("osd pg-upmap-items-bulk "
-	"name=args,type=CephString,n=N,req=false",
-	"set or clear multiple pg_upmap_items in one epoch. "
-	"CLI format: set <pgid> <from> <to> [...] [rm <pgid>] ... "
-	"or use -i <file> for JSON: {\"mappings\":[{\"pgid\":\"...\",\"action\":\"set|rm\",\"items\":[[from,to],...]},...]}",
+	"name=pgid,type=CephPgid,n=N",
+	"clear pg_upmap_items mapping for one or more <pgid>s in a single "
+	"osdmap epoch (developers only)",
         "osd", "rw")
 COMMAND("osd pg-upmap-primary "
 	"name=pgid,type=CephPgid "
