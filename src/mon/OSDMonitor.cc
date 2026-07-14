@@ -20,8 +20,10 @@
 #include <algorithm>
 #include <boost/algorithm/string.hpp>
 #include <experimental/iterator>
+#include <limits>
 #include <locale>
 #include <sstream>
+#include <string_view>
 
 #include "mon/OSDMonitor.h"
 #include "mon/Monitor.h"
@@ -10605,20 +10607,51 @@ static int parse_reweights(CephContext *cct,
   return 0;
 }
 
+// pg_t::parse() uses sscanf, which silently accepts trailing garbage
+// ("1.7junk" parses as 1.7).  these tokens arrive as plain CephString
+// args with no client-side CephPgid validation, so require the whole
+// token to match <pool>.<hex-seed> before handing it to parse().
+bool OSDMonitor::parse_pgid_token(const string& s, pg_t& pgid)
+{
+  size_t dot = s.find('.');
+  if (dot == 0 || dot == string::npos || dot + 1 == s.size() ||
+      s.find_first_not_of("0123456789") != dot ||
+      s.find_first_not_of("0123456789abcdefABCDEF", dot + 1)
+        != string::npos) {
+    return false;
+  }
+
+  string err;
+  uint64_t pool = strict_strtoull(string_view{s}.substr(0, dot), 10, &err);
+  if (!err.empty()) {
+    return false;
+  }
+  auto seed = strict_strtoull(string_view{s}.substr(dot + 1), 16, &err);
+  if (!err.empty() || seed > numeric_limits<ps_t>::max()) {
+    return false;
+  }
+  pgid = pg_t(static_cast<ps_t>(seed), pool);
+  return true;
+}
+
 // parse "<pgid> <from> <to> [<from> <to>...] [<pgid2> <from> <to>...]"
 // into per-pg groups of osd ids.  pgids and osd ids are unambiguous:
 // a pgid always contains '.' with a numeric pool id, while an osd id
 // is a bare integer or osd.<id>.
-static int parse_pg_upmap_items_args(
+int OSDMonitor::parse_pg_upmap_items_args(
     const vector<string>& args,
     vector<pair<pg_t,vector<int64_t>>>& groups,
     stringstream& ss)
 {
+  if (args.empty()) {
+    ss << "no pgid and osd id arguments given";
+    return -EINVAL;
+  }
   set<pg_t> seen;
   size_t i = 0;
   while (i < args.size()) {
     pg_t pgid;
-    if (!pgid.parse(args[i].c_str())) {
+    if (!parse_pgid_token(args[i], pgid)) {
       ss << "invalid pgid '" << args[i] << "'";
       return -EINVAL;
     }
@@ -10628,7 +10661,7 @@ static int parse_pg_upmap_items_args(
     }
     i++;
     vector<int64_t> id_vec;
-    for (pg_t next; i < args.size() && !next.parse(args[i].c_str()); i++) {
+    for (pg_t next; i < args.size() && !parse_pgid_token(args[i], next); i++) {
       string s = args[i];
       if (s.rfind("osd.", 0) == 0) {
 	s = s.substr(4);
@@ -10637,6 +10670,10 @@ static int parse_pg_upmap_items_args(
       int64_t id = strict_strtoll(s.c_str(), 10, &interr);
       if (!interr.empty()) {
 	ss << "invalid osd id or pgid '" << args[i] << "'";
+	return -EINVAL;
+      }
+      if (id < 0 || id > CRUSH_ITEM_NONE) {
+	ss << "osd id '" << args[i] << "' is out of range [0, 0x7fffffff]";
 	return -EINVAL;
       }
       id_vec.push_back(id);
@@ -13177,7 +13214,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       // all mappings land in a single osdmap epoch
       {
 	vector<string> args;
-	if (cmd_getval(cmdmap, "args", args)) {
+	if (cmd_getval(cmdmap, "args", args) && !args.empty()) {
 	  err = parse_pg_upmap_items_args(args, upmap_items_groups, ss);
 	  if (err < 0)
 	    goto reply_no_propose;
@@ -13198,6 +13235,14 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 	    err = -EINVAL;
 	    goto reply_no_propose;
 	  }
+	  for (auto id : id_vec) {
+	    // ids are narrowed to int32 when staged below
+	    if (id < 0 || id > CRUSH_ITEM_NONE) {
+	      ss << "osd id " << id << " is out of range [0, 0x7fffffff]";
+	      err = -EINVAL;
+	      goto reply_no_propose;
+	    }
+	  }
 	  upmap_items_groups.emplace_back(pgid, std::move(id_vec));
 	} else {
 	  ss << "no pgid and osd id arguments given";
@@ -13215,20 +13260,31 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       // in a single osdmap epoch
       {
 	vector<string> pgidstrs;
-	if (!cmd_getval(cmdmap, "pgid", pgidstrs)) {
-	  // legacy single-pg form from direct json clients
-	  string pgidstr;
-	  if (!cmd_getval(cmdmap, "pgid", pgidstr)) {
-	    ss << "unable to parse 'pgid' value(s)";
-	    err = -EINVAL;
-	    goto reply_no_propose;
-	  }
-	  pgidstrs.push_back(pgidstr);
+	auto pgid_it = cmdmap.find("pgid");
+	if (pgid_it == cmdmap.end()) {
+	  ss << "unable to parse 'pgid' value(s)";
+	  err = -EINVAL;
+	  goto reply_no_propose;
+	}
+	if (auto pgidstr = boost::get<string>(&pgid_it->second); pgidstr) {
+	  // legacy single-pg form from direct json clients (e.g. the mgr
+	  // balancer module); cmd_getval on a vector throws bad_cmd_get
+	  // for a scalar, so inspect the variant type instead
+	  pgidstrs.push_back(*pgidstr);
+	} else if (!cmd_getval(cmdmap, "pgid", pgidstrs)) {
+	  ss << "unable to parse 'pgid' value(s)";
+	  err = -EINVAL;
+	  goto reply_no_propose;
+	}
+	if (pgidstrs.empty()) {
+	  ss << "no pgid(s) given";
+	  err = -EINVAL;
+	  goto reply_no_propose;
 	}
 	set<pg_t> seen;
 	for (auto& pgidstr : pgidstrs) {
 	  pg_t p;
-	  if (!p.parse(pgidstr.c_str())) {
+	  if (!parse_pgid_token(pgidstr, p)) {
 	    ss << "invalid pgid '" << pgidstr << "'";
 	    err = -EINVAL;
 	    goto reply_no_propose;

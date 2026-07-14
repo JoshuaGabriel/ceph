@@ -48,6 +48,13 @@ add_executable(unittest_mon_pgmap
 add_ceph_unittest(unittest_mon_pgmap)
 target_link_libraries(unittest_mon_pgmap mon global)
 
+# unittest_mon_pg_upmap_items_parse
+add_executable(unittest_mon_pg_upmap_items_parse
+  test_pg_upmap_items_parse.cc
+  )
+add_ceph_unittest(unittest_mon_pg_upmap_items_parse)
+target_link_libraries(unittest_mon_pg_upmap_items_parse mon global)
+
 # unittest_mon_montypes
 add_executable(unittest_mon_montypes
   test_mon_types.cc

@@ -721,6 +721,16 @@ public:
   bool prepare_command(MonOpRequestRef op);
   bool prepare_command_impl(MonOpRequestRef op, const cmdmap_t& cmdmap);
 
+  // strict pgid parsing: unlike pg_t::parse(), rejects tokens with
+  // trailing garbage (e.g. "1.7junk")
+  static bool parse_pgid_token(const std::string& s, pg_t& pgid);
+  // parse 'osd pg-upmap-items' args:
+  // "<pgid> <from> <to> [<from> <to>...] [<pgid2> <from> <to>...]"
+  static int parse_pg_upmap_items_args(
+      const std::vector<std::string>& args,
+      std::vector<std::pair<pg_t,std::vector<int64_t>>>& groups,
+      std::stringstream& ss);
+
   int validate_osd_create(
       const int32_t id,
       const uuid_d& uuid,

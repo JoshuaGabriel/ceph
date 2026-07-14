@@ -1045,7 +1045,9 @@ COMMAND("osd rm-pg-upmap "
 	"clear pg_upmap mapping for <pgid> (developers only)",
         "osd", "rw")
 COMMAND("osd pg-upmap-items "
-	"name=args,type=CephString,n=N",
+	"name=args,type=CephString,n=N,req=false "
+	"name=pgid,type=CephPgid,req=false,positional=false "
+	"name=id,type=CephOsdName,n=N,req=false,positional=false",
 	"set pg_upmap_items mapping for one or more pgs in a single osdmap epoch: "
 	"<pgid> <from id> <to id> [<from id> <to id>...] "
 	"[<pgid2> <from id> <to id>...] (developers only)",
