@@ -557,7 +557,6 @@ def test_deploy_ceph_osd_container_crimson(cephadm_fs, funkypatch):
     assert '--entrypoint /usr/bin/ceph-osd-crimson' in runfile_lines[-1]
 
 
->>>>>>> 25de0e2ff05 (cephadm: skip bluestore-label keyring update when only caps differ)
 def test_deploy_ceph_exporter_container(cephadm_fs, funkypatch):
     mocks = _common_patches(funkypatch)
     _firewalld = mocks['Firewalld']
