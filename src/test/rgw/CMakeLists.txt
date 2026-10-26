@@ -242,6 +242,17 @@ target_include_directories(ceph_test_rgw_gc_log
 target_link_libraries(ceph_test_rgw_gc_log ${rgw_libs} radostest-cxx)
 install(TARGETS ceph_test_rgw_gc_log DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# unittest_rgw_get_obj_data
+add_executable(unittest_rgw_get_obj_data test_rgw_get_obj_data.cc)
+add_ceph_unittest(unittest_rgw_get_obj_data)
+target_include_directories(unittest_rgw_get_obj_data
+  SYSTEM PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/rgw
+    ${CMAKE_SOURCE_DIR}/src/rgw/driver/rados
+    ${CMAKE_SOURCE_DIR}/src/s3select/rapidjson/include
+)
+target_link_libraries(unittest_rgw_get_obj_data ${rgw_libs})
+
 add_ceph_test(test-ceph-diff-sorted.sh
   ${CMAKE_CURRENT_SOURCE_DIR}/test-ceph-diff-sorted.sh)
 
