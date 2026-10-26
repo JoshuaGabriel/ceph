@@ -1,3 +1,12 @@
+>=18.2.8
+--------
+
+* RGW: A new option ``rgw_get_obj_max_buffered_size`` (64 MiB by default)
+  limits how much data a single object read can hold while it waits for an
+  earlier, slower RADOS read. Previously a stalled read made RGW buffer the
+  remainder of the requested range, which could exhaust memory on large
+  objects. Set it to 0 to restore the old behavior.
+
 >=18.2.5
 --------
 

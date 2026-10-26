@@ -1871,6 +1871,24 @@ options:
   services:
   - rgw
   with_legacy: true
+- name: rgw_get_obj_max_buffered_size
+  type: size
+  level: advanced
+  desc: Maximum out-of-order data buffered by a single object read request
+  long_desc: An object read request keeps several RADOS reads in flight, up to
+    rgw_get_obj_window_size, but must send their data to the client in order.
+    Reads that complete before an earlier read are held in memory. Once this many
+    bytes are held, RGW stops issuing new reads for the request until the earlier
+    read completes, so a single slow read cannot make RGW buffer the rest of a large
+    object. A request can hold up to about this value plus rgw_get_obj_window_size.
+    0 disables the limit.
+  default: 64_M
+  services:
+  - rgw
+  see_also:
+  - rgw_get_obj_window_size
+  - rgw_get_obj_max_req_size
+  with_legacy: true
 - name: rgw_relaxed_s3_bucket_names
   type: bool
   level: advanced

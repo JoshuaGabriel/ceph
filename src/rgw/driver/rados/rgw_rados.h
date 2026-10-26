@@ -1640,11 +1640,14 @@ struct get_obj_data {
   rgw::Aio* aio;
   uint64_t offset; // next offset to write to client
   rgw::AioResultList completed; // completed read results, sorted by offset
+  uint64_t completed_size = 0; // bytes held in completed
+  uint64_t max_completed_size; // stop issuing reads at this completed_size, 0 for no limit
   optional_yield yield;
 
   get_obj_data(RGWRados* rgwrados, RGWGetDataCB* cb, rgw::Aio* aio,
-               uint64_t offset, optional_yield yield)
-               : rgwrados(rgwrados), client_cb(cb), aio(aio), offset(offset), yield(yield) {}
+               uint64_t offset, uint64_t max_completed_size, optional_yield yield)
+               : rgwrados(rgwrados), client_cb(cb), aio(aio), offset(offset),
+                 max_completed_size(max_completed_size), yield(yield) {}
   ~get_obj_data() {
     if (rgwrados->get_use_datacache()) {
       const std::lock_guard l(d3n_get_data.d3n_lock);
@@ -1654,7 +1657,10 @@ struct get_obj_data {
   D3nGetObjData d3n_get_data;
   std::atomic_bool d3n_bypass_cache_write{false};
 
+  // merge results into completed, write what's ready to the client, and
+  // wait for more completions while completed is over max_completed_size
   int flush(rgw::AioResultList&& results);
+  int merge_and_write(rgw::AioResultList&& results);
 
   void cancel() {
     // wait for all completions to drain and ignore the results

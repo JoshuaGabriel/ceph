@@ -6759,12 +6759,27 @@ int RGWRados::Object::Read::read(int64_t ofs, int64_t end,
 }
 
 int get_obj_data::flush(rgw::AioResultList&& results) {
+  int r = merge_and_write(std::move(results));
+  while (r == 0 && max_completed_size && completed_size >= max_completed_size) {
+    auto c = aio->wait();
+    if (c.empty()) {
+      break; // nothing in flight can fill the gap at offset
+    }
+    r = merge_and_write(std::move(c));
+  }
+  return r;
+}
+
+int get_obj_data::merge_and_write(rgw::AioResultList&& results) {
   int r = rgw::check_for_errors(results);
   if (r < 0) {
     return r;
   }
   std::list<bufferlist> bl_list;
 
+  for (const auto& e : results) {
+    completed_size += e.data.length();
+  }
   auto cmp = [](const auto& lhs, const auto& rhs) { return lhs.id < rhs.id; };
   results.sort(cmp); // merge() requires results to be sorted first
   completed.merge(results, cmp); // merge results in sorted order
@@ -6774,6 +6789,7 @@ int get_obj_data::flush(rgw::AioResultList&& results) {
 
     bl_list.push_back(bl);
     offset += bl.length();
+    completed_size -= bl.length();
     int r = client_cb->handle_data(bl, 0, bl.length());
     if (r < 0) {
       return r;
@@ -6862,9 +6878,10 @@ int RGWRados::Object::Read::iterate(const DoutPrefixProvider *dpp, int64_t ofs, 
   CephContext *cct = store->ctx();
   const uint64_t chunk_size = cct->_conf->rgw_get_obj_max_req_size;
   const uint64_t window_size = cct->_conf->rgw_get_obj_window_size;
+  const uint64_t max_buffered_size = cct->_conf->rgw_get_obj_max_buffered_size;
 
   auto aio = rgw::make_throttle(window_size, y);
-  get_obj_data data(store, cb, &*aio, ofs, y);
+  get_obj_data data(store, cb, &*aio, ofs, max_buffered_size, y);
 
   int r = store->iterate_obj(dpp, source->get_ctx(), source->get_bucket_info(), state.obj,
                              ofs, end, chunk_size, _get_obj_iterate_cb, &data, y);
