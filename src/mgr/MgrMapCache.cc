@@ -155,11 +155,26 @@ MgrMapCache<PyObject*>::~MgrMapCache() {
   this->clear();
 }
 
+void MgrMapCache<PyObject*>::defer_decref(PyObject* o) {
+  std::lock_guard l(deferred_lock);
+  deferred_decref.push_back(o);
+}
+
+void MgrMapCache<PyObject*>::drain_deferred() {
+  std::vector<PyObject*> to_drop;
+  {
+    std::lock_guard l(deferred_lock);
+    to_drop.swap(deferred_decref);
+  }
+  for (auto* o : to_drop) Py_DECREF(o);
+}
+
 PyObject* MgrMapCache<PyObject*>::get(std::string_view k) {
   if (!this->is_enabled() ||
       !this->is_cacheable(k) ||
       !PyGILState_Check())
         return nullptr;
+  drain_deferred();
   std::shared_lock l(this->m);
   auto it = this->cache_data.find(k);
   if (it == this->cache_data.end()) {
@@ -178,6 +193,7 @@ void MgrMapCache<PyObject*>::insert(std::string_view key, PyObject* value) {
     return;
   }
 
+  drain_deferred();
   Py_INCREF(value);
   auto res = CacheImp::insert(key, value);
 
@@ -187,16 +203,8 @@ void MgrMapCache<PyObject*>::insert(std::string_view key, PyObject* value) {
     return;
   }
 
-  auto schedule_decref = [](PyObject* obj) {
-    if (!obj) return;
-    if (Py_AddPendingCall(+[](void* p){ Py_DECREF((PyObject*)p); return 0; }, obj) != 0) {
-      PyGILState_STATE st = PyGILState_Ensure();
-      Py_DECREF(obj);
-      PyGILState_Release(st);
-    }
-  };
-  if (res.replaced.has_value()) schedule_decref(res.replaced.value());
-  if (res.evicted.has_value())  schedule_decref(res.evicted.value());
+  if (res.replaced.has_value()) Py_XDECREF(res.replaced.value());
+  if (res.evicted.has_value())  Py_XDECREF(res.evicted.value());
 
   dout(20) << ": inserted key: " << key << " py count: "
            << Py_REFCNT(value) << " hit/miss:"
@@ -209,7 +217,7 @@ void MgrMapCache<PyObject*>::erase(std::string_view key) noexcept {
   PyObject* o = nullptr;
   if (!this->extract(key, &o)) return;
 
-  Py_AddPendingCall(+[](void* p){ Py_DECREF((PyObject*)p); return 0; }, o);
+  defer_decref(o);
   dout(20) << ": erased key: " << key
            << " hit/miss:"
            << CacheImp::get_hits() << "/"
@@ -219,6 +227,11 @@ void MgrMapCache<PyObject*>::erase(std::string_view key) noexcept {
 void MgrMapCache<PyObject*>::clear() noexcept {
   std::vector<PyObject*> to_drop;
   this->drain(to_drop);
+  {
+    std::lock_guard l(deferred_lock);
+    to_drop.insert(to_drop.end(), deferred_decref.begin(), deferred_decref.end());
+    deferred_decref.clear();
+  }
   if (to_drop.empty()) return;
   PyGILState_STATE st = PyGILState_Ensure();
   for (auto* o : to_drop) Py_DECREF(o);
