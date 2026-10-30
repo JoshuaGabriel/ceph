@@ -15,6 +15,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <string>
@@ -184,6 +185,13 @@ public:
     erase(key);
   }
 private:
+  std::mutex deferred_lock;
+  std::vector<PyObject*> deferred_decref;
+
+  void defer_decref(PyObject* o);
+  // caller must hold the GIL
+  void drain_deferred();
+
   std::vector<std::string> get_tracked_keys() const noexcept override { return {"mgr_map_cache_enabled"}; }
   void handle_conf_change(const ConfigProxy& conf, const std::set<std::string>& changed) override;
 };
