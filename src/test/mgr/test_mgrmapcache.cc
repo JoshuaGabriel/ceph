@@ -23,6 +23,7 @@
 #include "mgr/MgrMapCache.h"
 
 #include "gtest/gtest.h"
+#include "test/unit.cc"
 
 PerfCounters *perfcounter = nullptr;
 
@@ -218,4 +219,44 @@ TEST(LFUCache, ConcurrentReads) {
 
   ASSERT_EQ(success_count, 10000);
   ASSERT_EQ(c.get_hits(), 10000);
+}
+
+class MgrMapCachePy : public ::testing::Test {
+protected:
+  static void SetUpTestSuite() {
+    Py_Initialize();
+  }
+  static void TearDownTestSuite() {
+    Py_Finalize();
+  }
+};
+
+TEST_F(MgrMapCachePy, ReplacedEntryIsReleased) {
+  MgrMapCache<PyObject*> cache;
+  PyObject* old_obj = PyDict_New();
+  PyObject* new_obj = PyDict_New();
+  const auto refcnt = Py_REFCNT(old_obj);
+
+  cache.insert("osd_map", old_obj);
+  cache.insert("osd_map", new_obj);
+  ASSERT_EQ(Py_REFCNT(old_obj), refcnt);
+
+  Py_DECREF(old_obj);
+  Py_DECREF(new_obj);
+}
+
+TEST_F(MgrMapCachePy, ErasedEntryIsReleased) {
+  MgrMapCache<PyObject*> cache;
+  PyObject* obj = PyDict_New();
+  const auto refcnt = Py_REFCNT(obj);
+
+  for (int i = 0; i < 100; ++i) {
+    cache.insert("pg_dump", obj);
+    std::thread t([&cache] { cache.erase("pg_dump"); });
+    t.join();
+  }
+  ASSERT_EQ(cache.get("pg_dump"), nullptr);
+  ASSERT_EQ(Py_REFCNT(obj), refcnt);
+
+  Py_DECREF(obj);
 }
